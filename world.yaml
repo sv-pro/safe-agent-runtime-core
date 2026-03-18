@@ -1,0 +1,57 @@
+# World definition — single source of truth for the ontology runtime.
+#
+# This file is read once at startup by world_loader.load_world().
+# After that, all policy lives in Python objects; this file is not re-read.
+#
+# actions:      closed set of actions that exist in this world
+# trust:        identity → trust level
+# capabilities: trust level → allowed action types
+# taint:        rules for tainted data propagation
+
+# ── Actions ───────────────────────────────────────────────────────────────────
+# Only actions listed here can be constructed as ActionRequests.
+# Any other action name raises UnknownActionError at request construction.
+
+actions:
+  read_data:
+    type: internal
+    params: []
+
+  summarize:
+    type: internal
+    params: [content]
+
+  send_email:
+    type: external
+    params: [to, body]
+    requires_approval: true
+
+# ── Trust map ─────────────────────────────────────────────────────────────────
+# Maps channel identity → trust level.
+# Unknown identities default to "untrusted" (fail-secure).
+
+trust:
+  user:     trusted
+  system:   trusted
+  external: untrusted
+
+# ── Capability matrix ─────────────────────────────────────────────────────────
+# Maps trust level → list of action types the level may perform.
+# Absence means the action type does not exist for that trust level.
+
+capabilities:
+  trusted:   [internal, external]
+  untrusted: [internal]
+
+# ── Taint rules ───────────────────────────────────────────────────────────────
+# tainted_sources: identities whose requests are auto-tagged as tainted
+# external_side_effect_rule: what happens when tainted data meets an external action
+#
+# Taint is independent of capability:
+#   - a trusted source can still carry tainted data (explicit taint=True)
+#   - an untrusted source auto-taints, but only external actions are blocked
+#   - internal actions are reachable even with tainted data
+
+taint:
+  tainted_sources: [external]
+  external_side_effect_rule: impossible
