@@ -1,79 +1,109 @@
 """
-Demo scenarios for the Safe Agent Runtime Core.
+Demo scenarios for the Constrained Execution Runtime.
 
-Demonstrates:
-  A) Ontological absence  — an action that does not exist in the world is impossible.
-  B) Taint containment    — an external (tainted) source cannot trigger external effects.
+Demonstrates the architectural invariant:
+  Unsafe actions are not denied — they are impossible to execute.
+
+Scenarios:
+  A) Ontological absence  — unknown action cannot be constructed (registry raises).
+  B) Taint containment    — trusted user with tainted data cannot trigger external action.
+  C) Capability boundary  — untrusted source cannot perform external actions.
+  D) Allowed execution    — trusted user with clean data executes successfully.
+  E) Approval gate        — approval-required action is blocked with clear error.
 """
 
-import json
-from runtime import evaluate, load_world
+from registry import ActionRequest
+from runtime import build_runtime
+from models import ImpossibleActionError, Source, TaintState
 
 
-def run(label, tool_call, world):
-    result = evaluate(tool_call, world)
+def run_demo(label, fn):
     print(f"[{label}]")
-    print(f"  tool_call : {json.dumps(tool_call)}")
-    print(f"  decision  : {result['decision']}")
-    print(f"  reason    : {result['reason']}")
+    try:
+        result = fn()
+        print(f"  result    : {result}")
+        print(f"  outcome   : EXECUTED")
+    except ImpossibleActionError as e:
+        print(f"  raised    : ImpossibleActionError")
+        print(f"  reason    : {e.reason}")
     print()
-    return result
 
 
 def main():
-    world = load_world("world.yaml")
+    runtime, registry = build_runtime("world.yaml")
 
     # ── Demo A: Ontological absence ───────────────────────────────────────────
-    # The action "delete_repository" is not defined in the world at all.
-    # It is not blocked — it simply cannot be constructed.
-    demo_a = run(
-        "Demo A — Ontological absence",
-        tool_call={
-            "action": "delete_repository",
-            "params": {},
-            "source": "external",
-        },
-        world=world,
-    )
-    assert demo_a["decision"] == "impossible", f"Expected 'impossible', got {demo_a['decision']!r}"
+    # "delete_repository" is not in the registry.
+    # registry.get() raises immediately — the action cannot be constructed at all.
+    print("[Demo A — Ontological absence]")
+    try:
+        registry.get("delete_repository")
+        raise AssertionError("Should have raised")
+    except ImpossibleActionError as e:
+        print(f"  registry.get('delete_repository') raised ImpossibleActionError")
+        print(f"  reason : {e.reason}")
+    print()
 
     # ── Demo B: Taint containment ─────────────────────────────────────────────
-    # The action "send_email" exists and is of type "external".
-    # Source "external" is tainted; a tainted source cannot trigger external effects.
-    demo_b = run(
-        "Demo B — Taint containment",
-        tool_call={
-            "action": "send_email",
-            "params": {"to": "client"},
-            "source": "external",
-        },
-        world=world,
-    )
-    assert demo_b["decision"] == "impossible", f"Expected 'impossible', got {demo_b['decision']!r}"
+    # A TRUSTED user carries tainted params (e.g., data from an external source).
+    # The capability check passes (user is trusted → can do external).
+    # The taint rule fires (tainted data + external action → impossible).
+    # This proves taint is distinct from trust and is live, reachable code.
+    def demo_b():
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),           # trusted source
+            params={"to": "target@example.com", "body": "<external injection>"},
+            taint=TaintState.TAINTED,        # data came from external source
+        )
+        return runtime.execute(request)
 
-    # ── Bonus: trusted user reading internal data — allowed ───────────────────
-    run(
-        "Bonus — Trusted user reads internal data",
-        tool_call={
-            "action": "read_data",
-            "params": {},
-            "source": "user",
-        },
-        world=world,
-    )
+    run_demo("Demo B — Taint containment (trusted user, tainted data, external action)", demo_b)
 
-    # ── Bonus: approval-required action ───────────────────────────────────────
-    run(
-        "Bonus — Trusted user downloads report (approval required)",
-        tool_call={
-            "action": "download_report",
-            "params": {},
-            "source": "user",
-        },
-        world=world,
-    )
+    # ── Demo C: Capability boundary ───────────────────────────────────────────
+    # Untrusted source cannot perform external actions — capability check fires.
+    def demo_c():
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("external"),       # untrusted
+            params={"to": "target@example.com"},
+            taint=TaintState.CLEAN,
+        )
+        return runtime.execute(request)
 
-    print("All assertions passed.")
+    run_demo("Demo C — Capability boundary (untrusted source, external action)", demo_c)
+
+    # ── Demo D: Allowed execution ─────────────────────────────────────────────
+    # Trusted user, clean data, internal action → executes.
+    def demo_d():
+        action = registry.get("read_data")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),
+            params={"query": "SELECT *"},
+            taint=TaintState.CLEAN,
+        )
+        return runtime.execute(request)
+
+    run_demo("Demo D — Allowed execution (trusted user, clean data, internal action)", demo_d)
+
+    # ── Demo E: Approval gate ─────────────────────────────────────────────────
+    # Approval-required action raises even for trusted user with clean data.
+    def demo_e():
+        action = registry.get("download_report")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),
+            params={"id": "report-001"},
+            taint=TaintState.CLEAN,
+        )
+        return runtime.execute(request)
+
+    run_demo("Demo E — Approval gate (trusted user, clean data, approval_required)", demo_e)
+
+    print("Demo complete.")
 
 
 if __name__ == "__main__":

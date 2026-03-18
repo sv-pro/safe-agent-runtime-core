@@ -17,3 +17,11 @@ trust:
 capabilities:
   trusted: [internal, external]
   untrusted: [internal]
+
+# Taint rules govern data-level contamination, independent of source trust.
+# A trusted source carrying tainted params is still blocked by these rules.
+# Rule: tainted data + external action → IMPOSSIBLE (not denied — structurally blocked).
+taint_rules:
+  - taint: tainted
+    action_type: external
+    reason: "Tainted data cannot trigger external actions"
