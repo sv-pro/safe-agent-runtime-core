@@ -1,0 +1,19 @@
+actions:
+  read_data:
+    type: internal
+  send_email:
+    type: external
+  download_report:
+    type: internal
+    approval_required: true
+  post_webhook:
+    type: external
+
+trust:
+  user: trusted
+  system: trusted
+  external: untrusted
+
+capabilities:
+  trusted: [internal, external]
+  untrusted: [internal]
