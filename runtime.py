@@ -1,79 +1,81 @@
 """
-Safe Agent Runtime Core — decision engine.
+Constrained Execution Runtime
 
-Evaluates a tool call request against a world definition and returns one of:
-  - "allow"            → action is permitted
-  - "impossible"       → action cannot be constructed in this world
-  - "require_approval" → action exists and is reachable, but needs human sign-off
+Invariant: unsafe actions are not denied — they are impossible to execute.
+
+All action invocations MUST go through Runtime.execute().
+Evaluation and execution are structurally coupled — no bypass path exists.
 """
+
+from typing import Any, Tuple
 
 import yaml
 
+from evaluator import Evaluator
+from registry import ActionRegistry, ActionRequest
+from models import ActionType, DecisionOutcome, ImpossibleActionError
 
-def load_world(path="world.yaml"):
-    """Load and return the world definition from a YAML file."""
+
+class Runtime:
+    """
+    Single execution boundary for all action invocations.
+
+    Flow:
+      1. Evaluator.check() validates all constraints (raises ImpossibleActionError on failure).
+      2. If decision is not ALLOW, raise ImpossibleActionError — never return a soft string.
+      3. Execute the action handler.
+
+    Tools MUST NOT be callable directly. Only Runtime.execute() triggers execution.
+    """
+
+    def __init__(self, registry: ActionRegistry, evaluator: Evaluator) -> None:
+        self._registry = registry
+        self._evaluator = evaluator
+
+    def execute(self, request: ActionRequest) -> Any:
+        """
+        Execute an ActionRequest through the constrained runtime.
+
+        Raises ImpossibleActionError if the request cannot proceed for any reason.
+        Never returns advisory decision strings — enforces or raises.
+        """
+        decision = self._evaluator.check(request)
+
+        if decision.outcome != DecisionOutcome.ALLOW:
+            raise ImpossibleActionError(f"Execution blocked — {decision.reason}")
+
+        return request.action._execute(request.params)
+
+
+def load_world(path: str = "world.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-def evaluate(tool_call, world):
+def build_runtime(world_path: str = "world.yaml") -> Tuple[Runtime, ActionRegistry]:
     """
-    Evaluate a tool call request against the world definition.
+    Bootstrap: load world definition, register all actions with handlers,
+    and wire together the Runtime.
 
-    Args:
-        tool_call: dict with keys "action", "params", "source"
-        world:     dict loaded from world.yaml
-
-    Returns:
-        dict with keys "decision" and "reason"
+    Returns (runtime, registry). Callers use registry.get(name) to obtain
+    Action objects for building ActionRequests — construction fails immediately
+    for any action not defined in world.yaml.
     """
-    action = tool_call["action"]
-    source = tool_call["source"]
+    world = load_world(world_path)
+    registry = ActionRegistry()
 
-    # Step 1: Check if action exists in the world.
-    if action not in world["actions"]:
-        return {
-            "decision": "impossible",
-            "reason": f"Action '{action}' is not defined in this world",
-        }
-
-    action_def = world["actions"][action]
-    action_type = action_def["type"]
-
-    # Step 2: Determine trust level for the source.
-    trust_map = world["trust"]
-    defaulted = source not in trust_map
-    trust_level = trust_map.get(source, "untrusted")
-
-    # Step 3: Check capability — does this trust level permit the action type?
-    allowed_types = world["capabilities"].get(trust_level, [])
-    if action_type not in allowed_types:
-        default_note = " (source unknown, defaulted to untrusted)" if defaulted else ""
-        return {
-            "decision": "impossible",
-            "reason": (
-                f"Source '{source}' (trust: {trust_level}{default_note}) is not permitted "
-                f"to perform actions of type '{action_type}'"
-            ),
-        }
-
-    # Step 4: Apply taint rule — external sources are always tainted.
-    tainted = source == "external"
-    if tainted and action_type == "external":
-        return {
-            "decision": "impossible",
-            "reason": "Tainted source cannot trigger external side-effects",
-        }
-
-    # Step 5: Some actions require explicit human approval before proceeding.
-    if action_def.get("approval_required", False):
-        return {
-            "decision": "require_approval",
-            "reason": f"Action '{action}' requires explicit approval before execution",
-        }
-
-    # All checks passed.
-    return {
-        "decision": "allow",
-        "reason": f"Action '{action}' is permitted for source '{source}'",
+    handlers = {
+        "read_data": lambda params: {"data": params.get("query", ""), "source": "db"},
+        "send_email": lambda params: {"sent": True, "to": params.get("to", "")},
+        "download_report": lambda params: {"report": params.get("id", ""), "bytes": 0},
+        "post_webhook": lambda params: {"status": 200, "url": params.get("url", "")},
     }
+
+    for name, cfg in world["actions"].items():
+        action_type = ActionType(cfg["type"])
+        approval_required = cfg.get("approval_required", False)
+        handler = handlers.get(name, lambda p: {})
+        registry.register(name, action_type, handler, approval_required)
+
+    evaluator = Evaluator(world)
+    return Runtime(registry, evaluator), registry
