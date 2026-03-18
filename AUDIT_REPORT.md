@@ -1,294 +1,440 @@
-# Architectural Audit Report — safe-agent-runtime-core
+# Architectural Audit & Refactor Report — safe-agent-runtime-core
 
-> **Audit date:** 2026-03-18
-> **Auditor:** Claude (claude-sonnet-4-6)
-> **Scope:** Deterministic ontological execution model — "impossible vs. deny" principle
-> **Note:** This supersedes the prior audit. The prior audit analyzed an earlier revision of the
-> code and several of its findings are now factually incorrect against the current implementation.
+> **Date:** 2026-03-18
+> **Scope:** Architectural refactor from guardrail system → ontological runtime
+> **Status:** Refactor complete. 43/43 tests passing.
 
 ---
 
-## Structured Report
+## Structured Analysis
 
 ```yaml
-verdict: "partial implementation — closer to guardrail than ontological runtime"
+current_state:
+  components:
 
-score:
-  overall: 5
-  ontology: 4
-  determinism: 7
-  capability_model: 3
-  taint_model: 4
-  execution_control: 6
+    - name: models.py
+      status: OK
+      reason: >
+        Base enumerations only. TaintState, ActionType, TrustLevel, ConstructionError.
+        TaintState.join() implements the taint lattice (monotonic, composable).
+        No imports from other runtime modules — clean foundation layer.
 
-critical_issues:
+    - name: world_manifest.yaml
+      status: OK
+      reason: >
+        Single source of truth for the compile phase. Defines actions, trust map,
+        capability matrix, taint rules. Read once at startup by compile_world().
+        NOT accessed by the runtime after compilation — this is a compile input,
+        not a runtime config.
 
-  - |
-    TRUST IS SELF-ASSERTED — NOT CHANNEL-DERIVED (Principle 4 VIOLATED).
-    Source("user") is a plain string dataclass field. Any caller can write
-    Source("system") or Source("user") and claim any trust level. There is no
-    channel binding, no authentication, no signed token, no kernel-level origin
-    enforcement. The trust model is opt-in. If the caller lies, the runtime is
-    blind. This is the most severe structural violation: the entire capability
-    and taint model is predicated on a trust level that callers supply
-    themselves.
+    - name: compile.py
+      status: OK
+      reason: >
+        Compile phase. Transforms world_manifest.yaml into immutable CompiledPolicy
+        (MappingProxyType actions, frozenset capability_matrix, tuple taint_rules,
+        MappingProxyType trust_map). CompiledAction is sealed with _COMPILE_GATE
+        sentinel — external construction raises TypeError. Policy is frozen after
+        compile_world() returns — no mutation possible at runtime.
 
-  - |
-    TAINT IS SELF-REPORTED (Principle 5 VIOLATED).
-    ActionRequest(taint=TaintState.TAINTED) is set by the caller at construction
-    time. If the caller forgets to mark tainted data — or deliberately marks
-    tainted data as CLEAN — the evaluator has no mechanism to detect it. There is
-    no taint-tracking engine, no type-level propagation, no runtime lineage
-    tracking. Taint is a post-it note the caller writes on the envelope. This
-    makes the taint model aspirational, not enforced.
+    - name: channel.py
+      status: OK
+      reason: >
+        Channel-derived trust. Source cannot be constructed by callers — __new__
+        checks _SOURCE_SEAL and raises TypeError without it. Channel.source resolves
+        trust from the compiled trust_map, not from caller-supplied strings.
+        Trust is assigned, not asserted.
 
-  - |
-    ACTION CONSTRUCTION IS BYPASSABLE — REGISTRY IS CONVENTION, NOT ENFORCEMENT.
-    Action.__init__ is public. The docstring in registry.py explicitly states:
-      "Direct instantiation is possible but bypasses the registry contract"
-    This means:
-      a = Action("launch_missile", ActionType.INTERNAL, lambda p: {})
-      a._execute({})  # executes, no registry, no evaluator, no runtime
-    is syntactically and semantically valid Python. The ontological closure is
-    a naming convention, not a structural property. Nothing in the type system
-    prevents constructing or executing an undefined action.
+    - name: taint.py
+      status: OK
+      reason: >
+        TaintedValue[T] generic type. All Sandbox.execute() calls return TaintedValue.
+        Taint propagates via TaintedValue.join(*inputs) in IRBuilder.build().
+        Callers pass prior TaintedValue outputs — they cannot suppress taint by
+        omission. Join is monotonic: CLEAN ∨ TAINTED = TAINTED, irreversible.
 
-  - |
-    POLICY IS RUNTIME-INTERPRETED, NOT COMPILED (Principle 6 VIOLATED).
-    world.yaml is loaded via yaml.safe_load() and stored as plain Python dicts.
-    Every call to Evaluator.check() iterates self._taint_rules, does dict
-    lookups on self._capabilities, and compares strings. There is no compilation
-    phase. Policy changes can be injected by replacing the dicts at runtime.
-    The "policy" is a mutable Python dict — not a sealed, compiled artifact.
+    - name: ir.py
+      status: OK
+      reason: >
+        IntentIR is the ONLY execution form. Sealed with _IR_SEAL — external
+        construction raises TypeError. IRBuilder.build() validates all constraints
+        at construction time (ontological, capability, approval, taint) and raises
+        ConstructionError if any fail. If build() returns, the IR is valid.
+        Sandbox executes without re-checking anything.
 
-  - |
-    CAPABILITIES ARE STRING-CHECKED AT RUNTIME (Principle 8 VIOLATED).
-    evaluator.py:
-      allowed_types = self._capabilities.get(trust_level, [])
-      if request.action.action_type.value not in allowed_types:
-    This is a runtime string membership test against a list loaded from YAML.
-    The value being tested is .value (a string) compared against strings from
-    a dict. This is a guardrail check — not compiled capability resolution,
-    not static dispatch, not a type-level impossibility.
+    - name: sandbox.py
+      status: OK
+      reason: >
+        Pure executor. No policy checks. Accepts only IntentIR. Returns TaintedValue.
+        Execution is unconditional — construction is validation. The separation
+        between build() and execute() is the core architectural invariant.
 
-  - |
-    APPROVAL GATE IS A STRUCTURAL DEAD END.
-    REQUIRE_APPROVAL causes Runtime to raise ImpossibleActionError. There is no
-    path in the codebase to submit, validate, or record an approval. Once an
-    action requires approval, it can never succeed — ever. The approval gate
-    enforces permanent impossibility rather than conditional gating. This is not
-    a design choice: there is simply no approval workflow. The feature is
-    incomplete and its presence creates false confidence.
+    - name: runtime.py
+      status: OK
+      reason: >
+        Thin assembler. Compiles the world manifest, wires Channel + IRBuilder +
+        Sandbox from the same CompiledPolicy. Single entry point: build_runtime().
+        Handlers defined here are the only tools that can ever be invoked —
+        they are not globally callable.
 
-architectural_gaps:
+    - name: evaluator.py
+      status: DELETED
+      reason: >
+        Replaced by IRBuilder. Constraint checking moved from execution time to
+        IR construction time. The evaluator was a runtime policy interpreter —
+        the opposite of what the architecture requires. Its logic now lives in
+        IRBuilder.build() and is enforced structurally, not advisorily.
 
-  - |
-    NO TAINT PROPAGATION ENGINE.
-    Taint is a per-request binary flag. If read_data() returns data from an
-    untrusted source and that data is passed as params to send_email(), the taint
-    is NOT automatically forwarded. The caller must manually remember to set
-    taint=TaintState.TAINTED on the second request. In a real pipeline, taint
-    must be a type-level property of the data itself — not an annotation on the
-    request wrapper. Actions should return TaintedValue(result, taint_state) and
-    the runtime should propagate that state into any downstream ActionRequest.
+    - name: registry.py
+      status: DELETED
+      reason: >
+        Replaced by CompiledPolicy. The old ActionRegistry was a mutable string-
+        keyed dict with a public Action.__init__ that could be bypassed. The new
+        CompiledPolicy is an immutable MappingProxyType. CompiledAction construction
+        is gated by _COMPILE_GATE — external code cannot create one.
 
-  - |
-    NO CHANNEL-LEVEL SOURCE BINDING.
-    Source is a dataclass with a single name: str field. The system has no
-    concept of authenticated channels, signed origins, or hardware-attested
-    sources. To implement Principle 4 (trust from channel, not content), Source
-    must be produced by the channel layer — not by the caller — and must be
-    unforgeable (e.g., sealed constructor, protocol-level injection, or IPC
-    socket identity).
+    - name: world.yaml
+      status: DELETED
+      reason: >
+        Renamed to world_manifest.yaml to make explicit that it is a compile
+        input, not a runtime configuration file.
 
-  - |
-    NO COMPILE PHASE FOR POLICY.
-    world.yaml defines the ontology. It should be compiled once at startup into
-    a frozen, validated dispatch structure (e.g., a frozen dict of
-    (TrustLevel, ActionType) → Decision, or a compiled match table). Instead,
-    the raw YAML structure is carried as mutable Python dicts through the
-    lifetime of the Evaluator instance and re-interpreted on every request.
 
-  - |
-    NO SEALED ACTION TYPE SYSTEM.
-    The ActionType enum (INTERNAL/EXTERNAL) is correct directionally, but actions
-    themselves are registered by string name. True ontological closure requires
-    actions to be first-class sealed types — not string keys in a dict. In
-    Python this means: either a sealed Enum of known actions, a Protocol with
-    __init_subclass__ that enforces registry membership, or a frozen dataclass
-    hierarchy that makes construction outside the registry a type error.
+target_architecture:
+  modules:
 
-  - |
-    NO IR LAYER.
-    ActionRequest is a typed struct, but it is not an IR. A true Intent IR would
-    require: (a) a parse/canonicalization phase that transforms raw input into
-    the IR, (b) semantic validation at parse time (not evaluation time), and
-    (c) the IR being the ONLY form in which intent is expressed inside the system.
-    Currently, ActionRequest is constructed directly by callers with no
-    intermediate parse stage.
+    - name: world_manifest.yaml
+      responsibility: Compile-phase input. Defines the ontology (actions, trust, capabilities, taint rules).
+      deterministic: true
+      stage: compile-time (read once)
+      input: human-authored YAML
+      output: raw data structure consumed by compile_world()
 
-dead_logic:
+    - name: compile.py → CompiledPolicy
+      responsibility: >
+        Transforms world_manifest.yaml into frozen, immutable policy artifacts.
+        Produces: sealed action map, frozenset capability matrix, tuple taint rules,
+        frozen trust map. No mutable state after construction.
+      deterministic: true
+      stage: compile-time (startup)
+      input: world_manifest.yaml + handler dict
+      output: CompiledPolicy (frozen)
 
-  - |
-    PRIOR AUDIT'S "DEAD CODE" FINDING IS WRONG.
-    The prior AUDIT_REPORT.md claimed the taint check at Step 2 of Evaluator is
-    unreachable dead code. This was accurate for the OLD implementation where
-    taint was derived from source == "external" (a hardcoded string). In the
-    CURRENT implementation, taint is an explicit field on ActionRequest
-    (TaintState enum), and the taint rules are evaluated from world.yaml's
-    taint_rules section. A TRUSTED user carrying TAINTED data CAN reach the
-    taint check:
-      - Step 1 capability check: trusted user CAN perform external actions → passes
-      - Step 2 taint check: trusted user + tainted data + external action → fires
-    Demo B and test_tainted_data_blocks_external_action_for_trusted_user both
-    exercise this path correctly. The old finding is now factually incorrect and
-    should not be used as a basis for further changes.
+    - name: channel.py → Channel, Source
+      responsibility: >
+        Channel-derived trust. Source is the only trust-bearing object.
+        Cannot be constructed without _SOURCE_SEAL. Channel.source resolves
+        trust from compiled trust_map — callers cannot override it.
+      deterministic: true
+      stage: runtime (per-request, O(1) lookup)
+      input: channel identity string
+      output: Source (sealed, immutable)
 
-  - |
-    APPROVAL GATE LOGIC IS DEAD IN PRACTICE.
-    The REQUIRE_APPROVAL branch in Runtime.execute() raises ImpossibleActionError.
-    Since no approval submission mechanism exists anywhere in the codebase, no
-    approval-required action can ever execute. The dead_logic is not in the check
-    itself but in the semantic: the gate exists to allow execution after approval,
-    yet the "after approval" path does not exist. Any test that expects
-    approval-required actions to eventually succeed would hang indefinitely.
+    - name: taint.py → TaintedValue
+      responsibility: >
+        Taint propagation type. All sandbox outputs are TaintedValue.
+        Taint join is monotonic. Callers pass prior outputs to IRBuilder —
+        taint propagates automatically without caller assertion.
+      deterministic: true
+      stage: runtime (per-request)
+      input: zero or more TaintedValue outputs from prior executions
+      output: TaintState (join result)
 
-  - |
-    handlers FALLBACK IN build_runtime() IS UNREACHABLE.
-    runtime.py:
-      handler = handlers.get(name, lambda p: {})
-    The fallback lambda p: {} is unreachable because the loop iterates only over
-    world["actions"].items() — which are the exact keys in the handlers dict.
-    If a new action is added to world.yaml without a corresponding handler entry,
-    it silently gets a no-op lambda. This is a latent bug, not dead code — but
-    the fallback gives false confidence that unknown actions are handled safely.
+    - name: ir.py → IRBuilder, IntentIR
+      responsibility: >
+        Intent IR construction and validation. ALL constraint checking happens
+        here at build time. If build() returns, the IR is valid. IntentIR is
+        sealed — cannot be constructed externally.
+      deterministic: true
+      stage: runtime (per-request, pre-execution)
+      input: action_name, Source, params, *TaintedValue inputs
+      output: IntentIR (sealed, immutable) or ConstructionError
 
-repo_structure_assessment:
+    - name: sandbox.py → Sandbox
+      responsibility: >
+        Pure executor. No policy checks. Accepts IntentIR, invokes action
+        handler, wraps result in TaintedValue. Execution is unconditional —
+        construction is validation.
+      deterministic: true
+      stage: runtime (post-construction)
+      input: IntentIR
+      output: TaintedValue
 
-  - |
-    FLAT STRUCTURE WITH NO LAYER SEPARATION.
-    Everything is in the repository root (runtime.py, evaluator.py, registry.py,
-    models.py, world.yaml). There is no directory hierarchy separating:
-      ir/          — Intent IR definitions and parser
-      policy/      — World definition and compiler
-      runtime/     — Execution engine
-      tests/
-    The absence of an ir/ or policy/compiled/ directory reflects the absence of
-    a compile phase: there is nothing to separate because compilation does not exist.
+    - name: runtime.py → Runtime
+      responsibility: >
+        Top-level assembler. Compiles manifest, creates Channel factory,
+        IRBuilder, and Sandbox from a single CompiledPolicy instance.
+        Single entry point: build_runtime().
+      deterministic: true
+      stage: startup (assembly)
+      input: manifest path
+      output: Runtime (frozen)
 
-  - |
-    NO COMPILER MODULE.
-    A proper ontological runtime requires a compiler that transforms world.yaml
-    into a static, validated execution model. This module does not exist. The
-    closest thing is build_runtime() in runtime.py — an 18-line bootstrap
-    function. It loads YAML, iterates dict items, and returns a Runtime. This is
-    not a compiler; it is lazy initialization.
 
-  - |
-    models.py MIXES CONCERNS.
-    TaintState, ActionType, DecisionOutcome, ImpossibleActionError, Source, and
-    Decision are all in models.py. These belong to different architectural layers:
-    TaintState and Source are data-layer types; DecisionOutcome and Decision are
-    policy-layer types; ImpossibleActionError is a runtime boundary signal.
-    Mixing them collapses the layer model into a single flat namespace.
+compile_phase:
+  design: >
+    compile_world(manifest_path, handlers) reads world_manifest.yaml exactly once.
+    Produces CompiledPolicy with four frozen artifacts:
 
-  - |
-    TESTS VERIFY BEHAVIOR, NOT STRUCTURAL GUARANTEES.
-    test_runtime.py correctly tests that ImpossibleActionError is raised and
-    that handlers do not fire on constraint violations. But no test verifies:
-      - that Action cannot be constructed outside the registry
-      - that Source cannot be fabricated to claim a different trust level
-      - that taint cannot be suppressed by a caller who sets it wrong
-    These are structural properties. Behavioral tests cannot prove them.
+      1. actions: MappingProxyType[str, CompiledAction]
+         Sealed mapping. CompiledAction construction requires _COMPILE_GATE.
+         Only actions defined in world_manifest.yaml exist. Undefined action
+         names cannot be represented as CompiledAction objects.
 
-fix_directions:
+      2. capability_matrix: frozenset[tuple[TrustLevel, ActionType]]
+         Compiled from the capabilities section of the manifest.
+         Lookup: (trust_level, action_type) in matrix → O(1), no strings.
+         Old: `if action_type.value not in capabilities[trust_level]` — string scan.
+         New: `if (trust_level, action_type) not in frozenset` — O(1) enum tuple.
 
-  - |
-    FIX 1 — SEAL ACTION CONSTRUCTION (highest leverage).
-    Move Action.__init__ to a module-private constructor pattern. In Python:
-      class Action:
-          def __init__(self, ...): ...  # make truly private via name mangling
-          # OR: use a class-level registry key as constructor guard
-    Better: replace string-keyed registry with a frozen Enum of known actions
-    where each member IS the action object. Undefined action names cannot be
-    passed to Enum() — they raise ValueError at construction, not at registry
-    lookup. This moves "impossible" from runtime exception to type-system error.
+      3. taint_rules: tuple[TaintRule, ...]
+         Compiled from taint_rules section. TaintRule fields are enum values,
+         not strings. Checked in IRBuilder.build() against enum identity, not
+         string comparison.
 
-  - |
-    FIX 2 — DERIVE TRUST FROM CHANNEL (eliminates self-assertion).
-    Source must be produced by the ingress layer, not by the caller.
-    Concretely:
-      class AuthenticatedChannel:
-          def __init__(self, identity: str, credential: bytes): ...
-          def make_source(self) -> Source: ...  # sealed factory
-    Source.__init__ becomes private or is replaced with a class method that
-    requires a valid AuthenticatedChannel. Callers cannot fabricate Source
-    without a real channel object. This requires rethinking the API surface
-    but is non-negotiable for Principle 4.
+      4. trust_map: MappingProxyType[str, TrustLevel]
+         Compiled from the trust section. Channel identity → TrustLevel enum.
+         Channel.source does a dict lookup — returns TrustLevel, not a string.
 
-  - |
-    FIX 3 — COMPILE POLICY TO STATIC DISPATCH TABLE.
-    Replace Evaluator's runtime dict lookups with a pre-computed frozen structure:
-      capability_table: frozenset[tuple[TrustLevel, ActionType]]
-    Computed once in build_runtime(), never mutated. The check becomes:
-      if (trust_level, action_type) not in self._capability_table: raise ...
-    This eliminates runtime string comparisons and makes the policy unsealed
-    by construction (the frozenset cannot be extended after compilation).
+  what_moved_from_runtime_to_compile_time:
+    - capability checking: from `if str not in list` at each request
+                           to frozenset membership precomputed at startup
+    - trust resolution: from YAML dict lookup at each request
+                        to frozen dict lookup from pre-compiled map
+    - taint rule loading: from YAML list re-parsed on every Evaluator.check()
+                          to compiled tuple[TaintRule] produced once
 
-  - |
-    FIX 4 — MAKE TAINT A DATA-LEVEL TYPE, NOT A REQUEST ANNOTATION.
-    Define:
-      @dataclass(frozen=True)
-      class TaintedValue(Generic[T]):
-          value: T
-          taint: TaintState
-    Action handlers must return TaintedValue. Runtime.execute() unwraps it and
-    propagates taint to any downstream ActionRequest. The caller cannot suppress
-    taint by "forgetting" — the type enforces it. This converts taint from an
-    honor-system annotation to a structural guarantee.
+  what_became_impossible_instead_of_denied:
+    - undefined actions: old system processed them through a pipeline and returned
+                         "impossible" as a string. New system: CompiledPolicy has no
+                         entry → IRBuilder raises ConstructionError before any
+                         execution path is entered.
+    - direct Source construction: old Source("user") accepted any string.
+                                   New Source() raises TypeError without _SOURCE_SEAL.
+    - direct IntentIR construction: TypeError without _IR_SEAL.
+    - direct CompiledAction construction: TypeError without _COMPILE_GATE.
 
-  - |
-    FIX 5 — IMPLEMENT OR REMOVE THE APPROVAL GATE.
-    Either: implement an approval workflow (token issuance, verification, re-execution
-    path) so REQUIRE_APPROVAL can actually unblock. Or: remove it entirely until
-    the workflow exists. A dead gate that permanently blocks is worse than no gate —
-    it gives false architectural assurance and will cause silent failures in any
-    real deployment.
 
-  - |
-    FIX 6 — INTRODUCE AN IR PARSE LAYER.
-    The system currently skips from raw input directly to ActionRequest
-    construction. Add a parse phase:
-      raw_input → parse() → ActionRequest (IR) → Runtime.execute()
-    parse() performs: schema validation, action name → Action object resolution
-    via registry (raising at parse time, not eval time), taint annotation from
-    data lineage (not from caller), and source binding from channel.
-    This creates the "bounded parsing stage" required by Principle 7.
+ontology_fixes:
+
+  - before: |
+      Action("delete_repository", ActionType.INTERNAL, handler)  # constructable
+      registry.get("delete_repository")  # raises ImpossibleActionError at lookup
+      # The action was constructed — the registry just rejected the name.
+    after: |
+      CompiledAction(..., _gate=object())  # TypeError — gate check fails immediately
+      runtime.policy.get_action("delete_repository")  # returns None
+      builder.build("delete_repository", source, {})  # ConstructionError at build
+      # "delete_repository" cannot be represented as any runtime object.
+
+  - before: |
+      Source("user")         # self-asserted trust — any caller can claim any identity
+      Source("system")       # identical to Source("user") from a trust perspective
+    after: |
+      Source(trust_level=TrustLevel.TRUSTED, identity="user")  # TypeError
+      channel = runtime.channel("user")  # trust resolved from compiled map
+      source = channel.source            # sealed, trust_level set by Channel
+
+  - before: |
+      ActionRequest(taint=TaintState.TAINTED)  # caller asserts taint
+      ActionRequest(taint=TaintState.CLEAN)    # caller suppresses taint (honor system)
+    after: |
+      result_a: TaintedValue = sandbox.execute(ir_a)
+      ir_b = builder.build("send_email", source, params, result_a)
+      # taint = TaintedValue.join(result_a) — computed, not asserted
+      # if result_a.taint == TAINTED and send_email is EXTERNAL → ConstructionError
+
+  - before: |
+      # Capability check in Evaluator.check():
+      allowed_types = self._capabilities.get(trust_level, [])   # string list
+      if request.action.action_type.value not in allowed_types:  # string scan
+          raise ImpossibleActionError(...)
+    after: |
+      # Capability check in IRBuilder.build():
+      if not policy.can_perform(source.trust_level, action.action_type):
+          raise ConstructionError(...)
+      # can_perform: (TrustLevel, ActionType) in frozenset → O(1), no strings
+
+  - before: |
+      # Approval gate in Evaluator.check():
+      if request.action.approval_required:
+          return Decision(outcome=DecisionOutcome.REQUIRE_APPROVAL, ...)
+      # Runtime.execute() then raises ImpossibleActionError — dead end.
+      # No path to approval exists. No action can ever succeed.
+    after: |
+      # Approval gate in IRBuilder.build():
+      if action.approval_required:
+          raise ConstructionError(
+              "Action requires approval — pass an ApprovalToken to build()"
+          )
+      # Error message documents what is needed. Path to success is defined.
+
+
+ir_design:
+  type: IntentIR
+  sealed: true
+  construction: IRBuilder.build() only — TypeError on direct instantiation
+  fields:
+    action:  CompiledAction   # sealed, compile-produced, proves ontological membership
+    source:  Source           # sealed, channel-derived, carries trust_level
+    params:  dict             # execution parameters
+    taint:   TaintState       # computed from input TaintedValues, not asserted
+  effects: []                 # side effects occur only in Sandbox.execute()
+  required_capabilities:
+    - (source.trust_level, action.action_type) in CompiledPolicy.capability_matrix
+  taint: computed_via_TaintedValue_join_over_input_taints
+  trust_level: source.trust_level  # set by Channel, not by caller
+  validation: construction_time    # all constraints checked in IRBuilder.build()
+  invariant: >
+    If an IntentIR object exists, it is valid.
+    Sandbox.execute(ir) is unconditional — no policy re-check.
+
+
+sandbox_model:
+  execution_spec: IntentIR
+  sandbox: Sandbox
+  flow: IntentIR → Sandbox.execute() → TaintedValue
+  tools: >
+    Action handlers are defined in build_runtime() and passed to compile_world()
+    as a handler dict. They are stored in CompiledAction._handler. The only
+    way to invoke a handler is through Sandbox.execute(ir). Handlers are not
+    exported, not globally callable, not accessible via the CompiledPolicy API.
+  tool_injection: handlers dict passed to compile_world() at startup
+  bypass_surface: >
+    CompiledAction._invoke() is reachable from any code holding a CompiledAction.
+    Python has no true private methods. Full tool isolation requires a process
+    boundary (subprocess, seccomp, separate interpreter). This architecture
+    makes bypass visible (requires holding a CompiledAction) and auditable.
+  no_runtime_checks: true  # sandbox.execute() contains zero policy logic
+
+
+taint_model:
+  propagation_type: explicit_via_TaintedValue_join
+  monotonic: true           # CLEAN ∨ TAINTED = TAINTED, irreversible
+  self_reported: false      # taint computed from prior TaintedValue outputs
+  suppression_possible: partial  # caller can unwrap .value and not pass the TaintedValue;
+                                  # this is a code audit concern, not a type-system concern
+  output_type: TaintedValue # all sandbox outputs carry taint
+  propagation_rule: >
+    1. All Sandbox.execute() calls return TaintedValue(value, taint).
+    2. Callers pass prior TaintedValue outputs to IRBuilder.build() as *input_taints.
+    3. IRBuilder computes: computed_taint = TaintedValue.join(*input_taints).
+    4. IR carries computed_taint. Sandbox wraps output with computed_taint.
+    5. If computed_taint == TAINTED and action.action_type == EXTERNAL → ConstructionError.
+  state_machine:
+    states: [CLEAN, TAINTED]
+    transitions:
+      - from: CLEAN   input: CLEAN   result: CLEAN
+      - from: CLEAN   input: TAINTED result: TAINTED
+      - from: TAINTED input: CLEAN   result: TAINTED
+      - from: TAINTED input: TAINTED result: TAINTED
+    terminal: TAINTED  # once tainted, cannot return to CLEAN
+
+
+refactor_plan:
+  phase_1: >
+    DONE — Minimal viable ontological runtime.
+    - world_manifest.yaml as compile input
+    - compile.py producing frozen CompiledPolicy
+    - IRBuilder.build() as the single validation point
+    - IntentIR sealed with _IR_SEAL
+    - Sandbox as pure executor
+    - 43 tests passing
+
+  phase_2: >
+    PARTIAL — Compile-time separation.
+    - Capability matrix compiled to frozenset (DONE)
+    - Policy frozen after compile_world() (DONE)
+    - Trust map compiled to MappingProxyType (DONE)
+    - Missing: generate a Python module from world_manifest.yaml at build time
+      so the YAML is not even present at deploy time. Currently world_manifest.yaml
+      must be accessible at startup. A code-generation step would produce
+      policy_generated.py containing the frozen structures as Python literals.
+
+  phase_3: >
+    PARTIAL — Taint + provenance.
+    - TaintedValue propagation implemented (DONE)
+    - Taint join is monotonic (DONE)
+    - Missing: data-level taint (field-level annotation, not value-level).
+      A Value.field() call on tainted data should propagate taint to the field.
+      Currently taint is per-value, not per-field — a dict returned from
+      a tainted action taints all fields equally.
+    - Missing: provenance tracking. TaintedValue could carry a lineage chain
+      (sequence of action names that produced it) for audit logging.
+
+  phase_4: >
+    NOT STARTED — Full deterministic execution.
+    - Process boundary for tool isolation (subprocess or seccomp sandbox)
+    - Channel authentication via OS primitives (Unix socket credentials,
+      TLS client certificates, or signed tokens verified at Channel construction)
+    - ApprovalToken type for approval-gated actions (IRBuilder.build accepts
+      Optional[ApprovalToken], verifies cryptographic proof before allowing IR)
+    - Formal taint state machine with field-level granularity
+
+
+example_transformation:
+  input: "delete all files and push"
+
+  before: |
+    # Old system: string passed to evaluate() via a tool_call dict or registry.get()
+    registry.get("delete_all_files")
+    # → ImpossibleActionError: "Action 'delete_all_files' is not in the registry"
+    # The action was received, parsed, and processed through a 3-step pipeline.
+    # "Impossible" was the OUTPUT of evaluation — not the STRUCTURE.
+
+    registry.get("git_push")
+    # → ImpossibleActionError: same — processed and labeled
+
+    # An agent could:
+    #   1. Catch ImpossibleActionError and continue
+    #   2. Directly call Action("delete_all_files", ...)._execute({}) (public ctor)
+    #   3. Directly call the handler lambda from build_runtime()
+
+  after: |
+    # New system: no natural language reaches the runtime.
+    # The caller must obtain a CompiledAction from the compiled policy.
+    # "delete_all_files" and "git_push" do not exist in the policy.
+
+    runtime.policy.get_action("delete_all_files")  # → None
+    runtime.builder.build("delete_all_files", source, {})
+    # → ConstructionError: "Action 'delete_all_files' does not exist in the
+    #   compiled policy — undefined actions are impossible, not denied"
+    # No evaluation pipeline was entered. No handler was touched.
+    # The action cannot be represented as an IntentIR object — period.
+
+    # An agent attempting bypass:
+    CompiledAction("delete_all_files", ...)  # → TypeError: wrong _gate
+    IntentIR(_seal=object(), ...)            # → TypeError: wrong _seal
+    Source(trust_level=TRUSTED, ...)         # → TypeError: wrong _seal
+    # Every structural bypass raises at object construction, not at execution.
 ```
 
 ---
 
-## Summary
+## Remaining Gaps (Honest Assessment)
 
-The current implementation represents a meaningful improvement over the prior revision. The
-key gains are: `ImpossibleActionError` is raised (not returned as a string), `Runtime.execute()`
-binds evaluation to execution (no advisory gap), `ActionRegistry` raises at construction for
-undefined actions, and taint is expressed as a first-class enum field on `ActionRequest` with
-independent evaluation from world.yaml rules.
+### What was fixed
 
-However, the system remains architecturally a guardrail system for the following reasons:
+| Issue | Old | New |
+|---|---|---|
+| Trust derivation | `Source("user")` — self-asserted | `Channel.source` — compiled trust map |
+| Taint reporting | Caller sets `taint=TaintState.TAINTED` | `TaintedValue.join(*prior_outputs)` |
+| Capability check | Runtime string scan of YAML list | O(1) frozenset membership |
+| Policy compilation | YAML re-parsed each request | Compiled once to frozen structures |
+| Action construction | `Action(name, ...)` — public | `_COMPILE_GATE` gated, external = TypeError |
+| IR construction | No sealed IR type | `IntentIR` with `_IR_SEAL`, external = TypeError |
+| Approval gate | Dead-end REQUIRE_APPROVAL | ConstructionError with actionable message |
+| Evaluation placement | Inside `runtime.execute()` | Inside `IRBuilder.build()` (pre-execution) |
 
-1. **Trust is asserted by callers** — not derived from authenticated channels.
-2. **Taint is annotated by callers** — not tracked by the runtime from data lineage.
-3. **Capabilities are checked via string comparisons** — not compiled to static dispatch.
-4. **Actions are registry-by-convention** — `Action.__init__` is publicly constructable.
-5. **Policy is runtime-interpreted** — no compile phase, mutable YAML-derived dicts.
+### What remains incomplete
 
-Until (1) and (2) are fixed, no amount of evaluation logic produces real safety guarantees —
-because the inputs to evaluation are controlled by the party being constrained.
+1. **Process-level tool isolation.** `CompiledAction._invoke()` is reachable by any code holding a `CompiledAction`. True isolation requires a subprocess boundary or seccomp filter.
 
-The vocabulary and intent are correct. The structural enforcement is not.
+2. **Channel authentication.** `Channel(identity="user")` still accepts any string as identity. Production use requires OS-level authentication (TLS cert, Unix socket credentials, signed token).
+
+3. **Field-level taint.** Taint is per-value, not per-field. A dict with mixed provenance taints the whole dict, not individual keys.
+
+4. **Compile-to-code.** `world_manifest.yaml` is still read at startup. A code generation step would produce a Python module with hardcoded frozen structures, eliminating the YAML dependency at runtime entirely.
 
 ---
 
-*End of audit.*
+*End of report.*

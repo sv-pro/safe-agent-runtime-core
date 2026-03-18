@@ -1,81 +1,115 @@
 """
-Constrained Execution Runtime
+Runtime — top-level assembler
+==============================
 
-Invariant: unsafe actions are not denied — they are impossible to execute.
+Compiles the world manifest and wires together Channel, IRBuilder, and Sandbox.
+This is the only module callers need to import.
 
-All action invocations MUST go through Runtime.execute().
-Evaluation and execution are structurally coupled — no bypass path exists.
+Architecture:
+
+    world_manifest.yaml
+          │
+          ▼
+    compile_world()  ──────────────────────► CompiledPolicy (frozen)
+          │                                       │
+          │              ┌────────────────────────┤
+          │              │                        │
+          ▼              ▼                        ▼
+       Channel       IRBuilder               Sandbox
+    (trust from    (construction-time      (pure executor,
+     compiled map)  constraint checks)      no checks)
+          │              │                        │
+          ▼              ▼                        ▼
+        Source  ──►  IntentIR  ──────────►  TaintedValue
+
+Invariant:
+    If sandbox.execute(ir) is called, ir was produced by IRBuilder.build().
+    If IRBuilder.build() returned, all constraints were satisfied at construction.
+    There are no runtime policy checks in the execution path.
+
+Caller flow:
+    runtime = build_runtime()
+    channel = runtime.channel("user")       # trust from compiled map
+    source  = channel.source               # sealed — cannot be fabricated
+    ir      = runtime.builder.build(       # raises ConstructionError on failure
+        "send_email", source, params,
+        *prior_tainted_outputs             # taint propagated automatically
+    )
+    result  = runtime.sandbox.execute(ir)  # pure execution, TaintedValue out
 """
 
-from typing import Any, Tuple
+from __future__ import annotations
 
-import yaml
+from typing import Any, Callable, Dict
 
-from evaluator import Evaluator
-from registry import ActionRegistry, ActionRequest
-from models import ActionType, DecisionOutcome, ImpossibleActionError
+from compile import CompiledPolicy, compile_world
+from channel import Channel
+from ir import IRBuilder
+from sandbox import Sandbox
 
 
 class Runtime:
     """
-    Single execution boundary for all action invocations.
+    Assembled runtime: compiled policy + channel factory + IR builder + sandbox.
 
-    Flow:
-      1. Evaluator.check() validates all constraints (raises ImpossibleActionError on failure).
-      2. If decision is not ALLOW, raise ImpossibleActionError — never return a soft string.
-      3. Execute the action handler.
-
-    Tools MUST NOT be callable directly. Only Runtime.execute() triggers execution.
+    Immutable after construction. All components are derived from the same
+    CompiledPolicy so trust assignments, capability matrix, and taint rules
+    are consistent across channel resolution, IR construction, and execution.
     """
 
-    def __init__(self, registry: ActionRegistry, evaluator: Evaluator) -> None:
-        self._registry = registry
-        self._evaluator = evaluator
+    __slots__ = ("_policy", "_builder", "_sandbox")
 
-    def execute(self, request: ActionRequest) -> Any:
+    def __init__(self, policy: CompiledPolicy) -> None:
+        object.__setattr__(self, "_policy", policy)
+        object.__setattr__(self, "_builder", IRBuilder(policy))
+        object.__setattr__(self, "_sandbox", Sandbox(policy))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("Runtime is immutable after construction")
+
+    def channel(self, identity: str) -> Channel:
         """
-        Execute an ActionRequest through the constrained runtime.
+        Create a Channel for the given identity.
 
-        Raises ImpossibleActionError if the request cannot proceed for any reason.
-        Never returns advisory decision strings — enforces or raises.
+        Trust is resolved from the compiled policy — the caller cannot
+        override or inject a trust level. Unknown identities resolve to
+        UNTRUSTED (fail-secure).
         """
-        decision = self._evaluator.check(request)
+        return Channel(identity=identity, policy=self._policy)
 
-        if decision.outcome != DecisionOutcome.ALLOW:
-            raise ImpossibleActionError(f"Execution blocked — {decision.reason}")
+    @property
+    def builder(self) -> IRBuilder:
+        """The IR builder. Use builder.build() to construct IntentIR."""
+        return self._builder
 
-        return request.action._execute(request.params)
+    @property
+    def sandbox(self) -> Sandbox:
+        """The execution sandbox. Use sandbox.execute(ir) to run IntentIR."""
+        return self._sandbox
+
+    @property
+    def policy(self) -> CompiledPolicy:
+        """The compiled policy. Read-only."""
+        return self._policy
 
 
-def load_world(path: str = "world.yaml") -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def build_runtime(world_path: str = "world.yaml") -> Tuple[Runtime, ActionRegistry]:
+def build_runtime(manifest_path: str = "world_manifest.yaml") -> Runtime:
     """
-    Bootstrap: load world definition, register all actions with handlers,
-    and wire together the Runtime.
+    Entry point: compile world manifest and return an assembled Runtime.
 
-    Returns (runtime, registry). Callers use registry.get(name) to obtain
-    Action objects for building ActionRequests — construction fails immediately
-    for any action not defined in world.yaml.
+    Handlers defined here are the ONLY tools that can ever be executed.
+    They are not globally callable — they exist only inside the sandbox,
+    reachable exclusively through Sandbox.execute(ir).
+
+    To add a tool: add it to world_manifest.yaml AND add a handler here.
+    A handler without a manifest entry is never registered (unreachable).
+    A manifest entry without a handler gets a no-op lambda (safe default).
     """
-    world = load_world(world_path)
-    registry = ActionRegistry()
-
-    handlers = {
-        "read_data": lambda params: {"data": params.get("query", ""), "source": "db"},
-        "send_email": lambda params: {"sent": True, "to": params.get("to", "")},
-        "download_report": lambda params: {"report": params.get("id", ""), "bytes": 0},
-        "post_webhook": lambda params: {"status": 200, "url": params.get("url", "")},
+    handlers: Dict[str, Callable[[Dict[str, Any]], Any]] = {
+        "read_data":       lambda p: {"data": p.get("query", ""), "source": "db"},
+        "send_email":      lambda p: {"sent": True, "to": p.get("to", "")},
+        "download_report": lambda p: {"report": p.get("id", ""), "bytes": 0},
+        "post_webhook":    lambda p: {"status": 200, "url": p.get("url", "")},
     }
-
-    for name, cfg in world["actions"].items():
-        action_type = ActionType(cfg["type"])
-        approval_required = cfg.get("approval_required", False)
-        handler = handlers.get(name, lambda p: {})
-        registry.register(name, action_type, handler, approval_required)
-
-    evaluator = Evaluator(world)
-    return Runtime(registry, evaluator), registry
+    policy = compile_world(manifest_path, handlers)
+    return Runtime(policy)
