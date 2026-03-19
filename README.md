@@ -210,3 +210,28 @@ safe-agent-runtime-core/
 Python 3.10+, PyYAML 6.0+
 
 For more on the design rationale: [docs/why-this-matters.md](docs/why-this-matters.md)
+
+---
+
+## Integrations
+
+All integrations route tool execution through SafeMCPProxy, enforcing construction-time constraints before any action reaches execution.
+
+### LangChain
+
+```bash
+python examples/langchain_integration.py
+```
+
+### OpenAI Responses API
+
+```bash
+export OPENAI_API_KEY=...
+python examples/openai_responses_integration.py
+```
+
+### MCP Server
+
+```bash
+python examples/mcp_server_with_proxy.py
+```
