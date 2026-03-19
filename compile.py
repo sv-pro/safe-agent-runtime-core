@@ -25,13 +25,28 @@ Sealing mechanism for CompiledAction:
   code cannot import _COMPILE_GATE (it is module-private by naming convention
   and is not exported). This makes CompiledAction construction outside the
   compile phase a TypeError at runtime, catching accidental bypass immediately.
+
+Execution boundary:
+  CompiledAction is PURE METADATA. It carries name, action_type, and
+  approval_required — nothing more. There is NO handler, NO _invoke() method,
+  and NO callable behavior on objects visible outside the Sandbox.
+
+  Handler registration and execution live exclusively in sandbox.py.
+  Callers holding a CompiledPolicy or CompiledAction reference cannot invoke
+  any handler — there is nothing to call.
+
+  The boundary is:
+    compile_world()       → CompiledPolicy (metadata only)
+    Sandbox(handlers)     → callable execution layer (private handler dict)
+    IRBuilder.build(ir)   → construction-time validation
+    Sandbox.execute(ir)   → the ONLY path to handler invocation
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import yaml
 
@@ -58,7 +73,12 @@ class TaintRule:
 
 class CompiledAction:
     """
-    A sealed, immutable action produced by the compile phase.
+    A sealed, immutable action descriptor produced by the compile phase.
+
+    CompiledAction is PURE METADATA. It proves the action exists in the
+    compiled world — it does NOT carry any callable handler or invocation
+    capability. There is no _invoke(), no _handler, and no way to trigger
+    execution from a CompiledAction reference.
 
     The only way to obtain a CompiledAction is from the CompiledPolicy
     returned by compile_world(). Attempting to construct one externally
@@ -66,15 +86,20 @@ class CompiledAction:
 
     The existence of a CompiledAction object is proof that the action
     was present in world_manifest.yaml at compile time.
+
+    Execution boundary:
+        To execute an action, callers must go through:
+            IRBuilder.build(action_name, ...)  → IntentIR
+            Sandbox.execute(ir)                → TaintedValue
+        Sandbox holds the private handler dict. CompiledAction does not.
     """
 
-    __slots__ = ("name", "action_type", "approval_required", "_handler")
+    __slots__ = ("name", "action_type", "approval_required")
 
     def __init__(
         self,
         name: str,
         action_type: ActionType,
-        handler: Callable[[Dict[str, Any]], Any],
         approval_required: bool,
         _gate: object,
     ) -> None:
@@ -86,21 +111,9 @@ class CompiledAction:
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "action_type", action_type)
         object.__setattr__(self, "approval_required", approval_required)
-        object.__setattr__(self, "_handler", handler)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("CompiledAction is immutable after construction")
-
-    def _invoke(self, params: Dict[str, Any]) -> Any:
-        """
-        Invoke the action handler.
-
-        Only Sandbox.execute() should call this. The underscore prefix is a
-        module-boundary signal. In Python, structural enforcement requires
-        keeping handlers inside the sandbox layer — enforced by architecture,
-        not by access control (Python has no true private methods).
-        """
-        return self._handler(params)
 
     def __repr__(self) -> str:
         return f"CompiledAction({self.name!r}, type={self.action_type.value!r})"
@@ -128,6 +141,9 @@ class CompiledPolicy:
     All capability lookups are O(1) frozenset membership tests.
     No YAML parsing, no string iteration, no dynamic rule evaluation
     occurs after compile_world() returns.
+
+    Note: CompiledPolicy contains CompiledAction metadata objects. These
+    carry no handler or invocation capability. Execution requires Sandbox.
     """
 
     __slots__ = ("_actions", "_capability_matrix", "_taint_rules", "_trust_map")
@@ -151,7 +167,11 @@ class CompiledPolicy:
 
     @property
     def actions(self) -> MappingProxyType:
-        """Read-only view of compiled actions. Cannot be mutated."""
+        """Read-only view of compiled action descriptors. Cannot be mutated.
+
+        These are METADATA objects only. They carry no callable behavior.
+        To execute an action, use Sandbox.execute(ir) with an IRBuilder-produced IR.
+        """
         return self._actions
 
     def get_action(self, name: str) -> Optional[CompiledAction]:
@@ -201,48 +221,40 @@ class CompiledPolicy:
 
 # ── compile_world ─────────────────────────────────────────────────────────────
 
-def compile_world(
-    manifest_path: str,
-    handlers: Dict[str, Callable[[Dict[str, Any]], Any]],
-) -> CompiledPolicy:
+def compile_world(manifest_path: str) -> CompiledPolicy:
     """
     Compile phase entry point.
 
     Reads world_manifest.yaml exactly once. Produces an immutable
-    CompiledPolicy. After this function returns, the YAML file is not
-    accessed again by any runtime component.
+    CompiledPolicy containing pure metadata. After this function returns,
+    the YAML file is not accessed again by any runtime component.
+
+    Handlers are NOT accepted here. They belong to the Sandbox layer,
+    which is the only layer with execution capability. This separation
+    ensures CompiledPolicy (and the CompiledAction objects it contains)
+    carry zero callable behavior — policy and execution are distinct.
 
     Parameters
     ----------
     manifest_path : str
         Path to world_manifest.yaml.
-    handlers : dict
-        Action name → callable. Defines the tools that exist inside the
-        sandbox. Actions in the manifest without a handler get a no-op.
-        These handlers are the ONLY tools that can ever be executed —
-        they are not globally callable, only reachable through Sandbox.execute().
     """
     with open(manifest_path) as f:
         raw = yaml.safe_load(f)
 
-    # ── Compile actions ───────────────────────────────────────────────────────
+    # ── Compile actions (metadata only — no handlers) ─────────────────────────
     actions: Dict[str, CompiledAction] = {}
     for name, cfg in raw["actions"].items():
         action_type = ActionType(cfg["type"])
         approval_required = bool(cfg.get("approval_required", False))
-        handler = handlers.get(name, lambda p: {})
         actions[name] = CompiledAction(
             name=name,
             action_type=action_type,
-            handler=handler,
             approval_required=approval_required,
             _gate=_COMPILE_GATE,
         )
 
     # ── Compile capability matrix → frozenset[(TrustLevel, ActionType)] ───────
-    # The old system did: `if action_type.value not in capabilities[trust_level]`
-    # which is a runtime string list scan. This compiles it to a frozenset so
-    # the check becomes a single O(1) membership test with no strings.
     raw_capabilities: Dict[str, list] = raw.get("capabilities", {})
     capability_matrix: FrozenSet[Tuple[TrustLevel, ActionType]] = frozenset(
         (TrustLevel(trust_str), ActionType(action_type_str))
@@ -262,9 +274,6 @@ def compile_world(
     )
 
     # ── Compile trust map → MappingProxyType[str, TrustLevel] ────────────────
-    # The old system did: `self._trust.get(source.name, "untrusted")` — a string
-    # lookup that returned a string. Now it returns a TrustLevel enum value,
-    # used in the frozenset capability check without any string conversion.
     raw_trust: Dict[str, str] = raw.get("trust", {})
     trust_map: Dict[str, TrustLevel] = {
         identity: TrustLevel(trust_str)
