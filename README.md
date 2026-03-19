@@ -32,11 +32,29 @@ Taint works the same way. Tainted data flowing into an external action does not 
 
 ---
 
+## Safe MCP Proxy demo
+
+```bash
+python demo_proxy.py
+```
+
+A thin proxy layer sits between an agent/LLM client and tool execution,
+enforcing the ontology runtime before any tool call reaches execution.
+All three demo scenarios — unknown tool, tainted external call, clean
+internal call — demonstrate that the proxy is not advisory: it is the
+only route. There is no side door to tool execution.
+
+This is not a full MCP implementation. It demonstrates the enforcement shape:
+agent request → proxy validation → runtime construction → worker subprocess.
+
+---
+
 ## 60-second quickstart
 
 ```bash
 pip install pyyaml
 python demo.py
+python demo_proxy.py
 pytest
 ```
 
@@ -141,6 +159,7 @@ The only thing that crosses the subprocess boundary is an `ExecutionSpec` (actio
 safe-agent-runtime-core/
 ├── world_manifest.yaml          # declares actions, trust, capabilities, taint rules
 ├── demo.py                      # three scenarios: unknown action, taint block, subprocess exec
+├── demo_proxy.py                # proxy layer demo: unknown tool, tainted call, allowed call
 ├── runtime/
 │   ├── models.py                # TaintState, ActionType, TrustLevel, ConstructionError
 │   ├── compile.py               # manifest → frozen CompiledPolicy
@@ -149,10 +168,13 @@ safe-agent-runtime-core/
 │   ├── ir.py                    # sealed IntentIR + IRBuilder (all checks at construction)
 │   ├── executor.py              # subprocess transport — no handlers
 │   ├── worker.py                # standalone subprocess; closed handler registry
-│   └── runtime.py               # build_runtime() — wires everything
+│   ├── runtime.py               # build_runtime() — wires everything
+│   ├── protocol.py              # ToolRequest / ProxyResponse (proxy surface types)
+│   └── proxy.py                 # SafeMCPProxy — in-path enforcement layer
 └── tests/
     ├── test_new_runtime.py      # core invariant tests
-    └── test_process_boundary.py # boundary property tests
+    ├── test_process_boundary.py # boundary property tests
+    └── test_proxy.py            # proxy layer tests
 ```
 
 ---
