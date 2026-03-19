@@ -18,22 +18,14 @@ Sealing mechanism:
     for it. External code cannot import _SOURCE_SEAL, so cannot construct
     a Source without going through Channel.source. Any attempt raises TypeError
     at object creation time.
-
-Limitation (inherent to Python):
-    Python has no true private constructors at the language level. A determined
-    caller can use object.__new__(Source) to bypass __new__, then object.__setattr__
-    to set fields directly. This is the "physics limit" of Python enforcement.
-    In a production system, move Source construction into a C extension or use
-    OS-level channel authentication (e.g., Unix socket credentials, TLS certs).
-    This implementation makes casual bypass a TypeError and documents the gap.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from compile import CompiledPolicy
-from models import TrustLevel
+from .compile import CompiledPolicy
+from .models import TrustLevel
 
 
 # ── Module-private seal ───────────────────────────────────────────────────────
@@ -98,11 +90,6 @@ class Source:
 class Channel:
     """
     Authenticated channel. The only factory for Source objects.
-
-    In a real system, channel identity would be authenticated by the
-    transport layer (TLS client certificate, Unix socket credentials,
-    IPC kernel audit, signed token verified by the runtime). Here,
-    identity is a string resolved against the compiled trust map.
 
     The key property is that Channel — not the caller — creates the Source.
     The caller cannot inject a different trust_level into the Source because

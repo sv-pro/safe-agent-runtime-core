@@ -19,19 +19,14 @@ This proves the execution happened in a different process.
 from __future__ import annotations
 
 import os
-import sys
 
-_ROOT = os.path.dirname(os.path.abspath(__file__))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-
-from models import ConstructionError, TaintState
 from runtime import build_runtime
-from taint import TaintContext, TaintedValue
+from runtime.models import ConstructionError, TaintState
+from runtime.taint import TaintContext, TaintedValue
 
 SEP = "=" * 60
 
-runtime = build_runtime(os.path.join(_ROOT, "world_manifest.yaml"))
+runtime = build_runtime(os.path.join(os.path.dirname(os.path.abspath(__file__)), "world_manifest.yaml"))
 
 
 # ── Demo 1: Unknown action — ontological absence ───────────────────────────────
@@ -122,8 +117,8 @@ print()
 print("Demo complete.")
 print()
 print("Architecture summary:")
-print("  - Process boundary:   handlers live only in worker.py (separate process)")
+print("  - Process boundary:   handlers live only in runtime/worker.py (separate process)")
 print("  - Execution path:     IRBuilder.build() → ExecutionSpec → worker subprocess")
 print("  - Taint boundary:     TaintContext required by IRBuilder.build(); cannot be omitted")
 print("  - Policy boundary:    worker does no policy evaluation; main process does no execution")
-print("  - Demo path:          runtime.py / compile.py / ir.py / executor.py / worker.py")
+print("  - Demo path:          runtime/runtime.py / compile.py / ir.py / executor.py / worker.py")
