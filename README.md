@@ -32,6 +32,18 @@ Taint works the same way. Tainted data flowing into an external action does not 
 
 ---
 
+## LLM-in-the-loop demo
+
+```bash
+python demo_llm.py
+```
+
+The LLM only proposes tool calls — it turns natural language into a structured
+`ToolRequest`. The `SafeMCPProxy` and ontology runtime are the enforcement point:
+unsafe proposals are rejected at IR construction time and never reach the worker
+subprocess. A real provider can be swapped in via `OPENAI_API_KEY`, but the
+default path is deterministic and runs offline.
+
 ## Safe MCP Proxy demo
 
 ```bash
@@ -55,6 +67,7 @@ agent request → proxy validation → runtime construction → worker subproces
 pip install pyyaml
 python demo.py
 python demo_proxy.py
+python demo_llm.py
 pytest
 ```
 
@@ -160,6 +173,7 @@ safe-agent-runtime-core/
 ├── world_manifest.yaml          # declares actions, trust, capabilities, taint rules
 ├── demo.py                      # three scenarios: unknown action, taint block, subprocess exec
 ├── demo_proxy.py                # proxy layer demo: unknown tool, tainted call, allowed call
+├── demo_llm.py                  # LLM-in-the-loop demo: proposer → proxy → runtime → worker
 ├── runtime/
 │   ├── models.py                # TaintState, ActionType, TrustLevel, ConstructionError
 │   ├── compile.py               # manifest → frozen CompiledPolicy
@@ -170,11 +184,13 @@ safe-agent-runtime-core/
 │   ├── worker.py                # standalone subprocess; closed handler registry
 │   ├── runtime.py               # build_runtime() — wires everything
 │   ├── protocol.py              # ToolRequest / ProxyResponse (proxy surface types)
-│   └── proxy.py                 # SafeMCPProxy — in-path enforcement layer
+│   ├── proxy.py                 # SafeMCPProxy — in-path enforcement layer
+│   └── llm_demo.py              # MockLLMProposer + optional OpenAIProposer
 └── tests/
     ├── test_new_runtime.py      # core invariant tests
     ├── test_process_boundary.py # boundary property tests
-    └── test_proxy.py            # proxy layer tests
+    ├── test_proxy.py            # proxy layer tests
+    └── test_llm_demo.py         # LLM demo invariant tests
 ```
 
 ---
