@@ -1,18 +1,19 @@
 """
-Ontology runtime demo — new architecture.
+Ontology runtime demo — subprocess execution boundary.
 
-Demonstrates the closed execution boundary and structural taint threading.
+Demonstrates the process boundary between policy/IR logic and execution.
 
 Run:  python demo.py
 
 What this demo proves:
-  1. Unknown actions fail at construction — they cannot be represented at all.
-  2. Tainted data cannot cross an external boundary — IR construction is blocked.
-  3. Tainted internal actions succeed — taint is not a blanket block.
+  1. Unknown actions fail at construction — worker is never invoked.
+  2. Tainted data cannot cross an external boundary — IR blocked before worker.
+  3. Allowed internal actions cross the process boundary to the worker.
 
-This demo uses ONLY the new ontology runtime (compile / ir / sandbox / runtime).
-The old src/ advisory runtime is NOT the canonical path. See src/ for the
-legacy implementation, which remains for reference only.
+The worker announces itself on stderr when it executes:
+  [worker] executed read_data
+
+This proves the execution happened in a different process.
 """
 
 from __future__ import annotations
@@ -24,9 +25,9 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from models import ConstructionError
+from models import ConstructionError, TaintState
 from runtime import build_runtime
-from taint import TaintContext
+from taint import TaintContext, TaintedValue
 
 SEP = "=" * 60
 
@@ -36,9 +37,8 @@ runtime = build_runtime(os.path.join(_ROOT, "world_manifest.yaml"))
 # ── Demo 1: Unknown action — ontological absence ───────────────────────────────
 #
 # Attempt to build an IR for an action that does not exist in the world.
-# Expected: ConstructionError raised at IRBuilder.build() — no execution path.
-# This is not a runtime denial. The action cannot be represented at all.
-# The world does not contain this action; therefore it cannot be constructed.
+# Expected: ConstructionError raised at IRBuilder.build() — worker never called.
+# The action cannot be represented; the process boundary is never crossed.
 
 print(SEP)
 print("DEMO 1 — Unknown action (ontological absence)")
@@ -56,44 +56,27 @@ try:
     print("BUG: should not reach here")
 except ConstructionError as e:
     print(f"ConstructionError : {e}")
-    print("Result            : action does not exist in this world — IR cannot be formed")
+    print("Result            : action does not exist — IR cannot be formed, worker not called")
 print()
 
 
 # ── Demo 2: Taint containment — tainted data vs external boundary ─────────────
 #
-# A trusted source reads internal data → gets back a TaintedValue (tainted
-# because it came from a tainted-source channel in this scenario).
-#
-# The caller then attempts to send that tainted data via an external action.
-# Expected: ConstructionError at IRBuilder.build() — the taint rule fires
-# before any execution is attempted. Taint is real physics, not a label.
-#
-# Note: We simulate taint by using an "external" channel (untrusted, auto-tainted
-# by the taint rule) to read data, then attempt to forward it externally.
-# The "external" channel maps to UNTRUSTED → can only reach INTERNAL actions.
-# To make Demo 2 clearer, we use a trusted channel but manually carry a TAINTED
-# TaintContext, which is what would happen if the data source were tainted.
+# A trusted source holds tainted data and attempts an external action.
+# Expected: ConstructionError at IRBuilder.build() — taint rule fires before
+# the ExecutionSpec is created. Worker process is never invoked.
 
 print(SEP)
 print("DEMO 2 — Taint containment")
-print("trusted source, tainted data (TaintContext.from_outputs of TAINTED result)")
-print("→ attempts external action (post_webhook)")
+print("trusted source, tainted data → external action (post_webhook)")
 print("-" * 60)
 try:
     channel = runtime.channel("user")   # trusted
     source = channel.source
 
-    # Simulate: prior pipeline step produced a tainted result
-    # (e.g., data was read from an untrusted source earlier in the chain)
-    from taint import TaintedValue
-    from models import TaintState
     tainted_prior = TaintedValue(value={"data": "untrusted content"}, taint=TaintState.TAINTED)
-
-    # Build context carrying the taint forward (structural — cannot be omitted)
     ctx = TaintContext.from_outputs(tainted_prior)
 
-    # Attempt to use tainted data in an external action
     ir = runtime.builder.build(
         "post_webhook",
         source,
@@ -103,40 +86,44 @@ try:
     print("BUG: should not reach here")
 except ConstructionError as e:
     print(f"ConstructionError : {e}")
-    print("Result            : taint blocks external boundary — IR cannot be formed")
+    print("Result            : taint blocks external boundary — worker not called")
     print("                    this is not a guardrail, it is a law of construction")
 print()
 
 
-# ── Demo 3: Allowed tainted internal action ────────────────────────────────────
+# ── Demo 3: Allowed internal action — crosses subprocess boundary ──────────────
 #
-# A trusted source uses tainted data for an INTERNAL action (read_data).
-# Expected: IRBuilder.build() succeeds, sandbox.execute() runs, TaintedValue returned.
-# Not everything tainted is impossible — only tainted + external is impossible.
-# The taint is preserved in the output (monotonic propagation).
+# A trusted source uses a clean context for an INTERNAL action (read_data).
+# Expected: IRBuilder.build() succeeds, ExecutionSpec is sent to the worker
+# subprocess, worker executes and returns result, TaintedValue returned.
+#
+# Watch for: [worker] executed read_data  (printed by worker.py to stderr)
+# This line is your proof the execution happened in a different process.
 
 print(SEP)
-print("DEMO 3 — Tainted internal action (allowed)")
-print("trusted source, tainted context → internal action (read_data)")
+print("DEMO 3 — Allowed internal action (crosses subprocess boundary)")
+print("trusted source, clean context → internal action (read_data)")
+print("→ worker subprocess will announce execution on stderr")
 print("-" * 60)
+
 channel = runtime.channel("user")
 source = channel.source
 
-tainted_input = TaintedValue(value={"query": "user-supplied query"}, taint=TaintState.TAINTED)
-ctx = TaintContext.from_outputs(tainted_input)
-
-ir = runtime.builder.build("read_data", source, tainted_input.value, ctx)
-result = runtime.sandbox.execute(ir)
+ctx = TaintContext.clean()
+ir = runtime.builder.build("read_data", source, {"query": "sales Q1"}, ctx)
+result = runtime.sandbox.execute(ir)   # dispatches to worker.py subprocess
 
 print(f"IR taint   : {ir.taint.value}")
 print(f"Result     : {result}")
 print(f"Output     : {result.value}")
-print(f"Taint out  : {result.taint.value}  ← taint preserved, not silently dropped")
-print("Result     : tainted internal action executes — taint blocks only external crossing")
+print(f"Taint out  : {result.taint.value}")
+print("Result     : execution crossed process boundary — worker ran handler, returned result")
 print()
 print("Demo complete.")
 print()
 print("Architecture summary:")
-print("  - Execution boundary: CompiledAction has no _invoke(); only Sandbox.execute() runs handlers")
-print("  - Taint boundary:     TaintContext required by IRBuilder.build(); cannot be dropped by omission")
-print("  - Demo path:          uses runtime.py / compile.py / ir.py / sandbox.py (NOT src/)")
+print("  - Process boundary:   handlers live only in worker.py (separate process)")
+print("  - Execution path:     IRBuilder.build() → ExecutionSpec → worker subprocess")
+print("  - Taint boundary:     TaintContext required by IRBuilder.build(); cannot be omitted")
+print("  - Policy boundary:    worker does no policy evaluation; main process does no execution")
+print("  - Demo path:          runtime.py / compile.py / ir.py / executor.py / worker.py")
