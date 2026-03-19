@@ -2,10 +2,10 @@
 Runtime — top-level assembler
 ==============================
 
-Compiles the world manifest and wires together Channel, IRBuilder, and Sandbox.
+Compiles the world manifest and wires together Channel, IRBuilder, and Executor.
 This is the only module callers need to import for normal use.
 
-Architecture:
+Architecture (subprocess boundary edition):
 
     world_manifest.yaml
           │
@@ -14,32 +14,41 @@ Architecture:
           │                                       │
           │              ┌────────────────────────┤
           │              │                        │
-          ▼              ▼                        │
-       Channel       IRBuilder               handlers dict
-    (trust from    (construction-time      (local to build_runtime,
-     compiled map)  constraint checks)      passed to Sandbox only)
-          │              │                        │
           ▼              ▼                        ▼
-        Source  ──►  IntentIR  ──────────►  Sandbox (owns handlers)
+       Channel       IRBuilder               Executor (no handlers — subprocess only)
+    (trust from    (construction-time            │
+     compiled map)  constraint checks)           │ stdin/stdout
+          │              │                        ▼
+          ▼              ▼                   worker.py subprocess
+        Source  ──►  IntentIR  ──────────►  (owns handlers, separate process)
                                                   │
                                                   ▼
                                             TaintedValue
 
+Process boundary:
+    - The main process (this file) holds NO callable handlers.
+    - Executor is a transport facade: it creates an ExecutionSpec and sends it
+      to worker.py via subprocess stdin/stdout.
+    - worker.py runs in a separate process and owns the real handlers.
+    - The main process cannot call handler functions directly.
+
 Execution boundary:
     - CompiledPolicy exposes CompiledAction metadata objects (no handlers, no _invoke).
-    - Sandbox is the sole owner of callable handlers.
-    - The only path to handler invocation: IRBuilder.build() → Sandbox.execute().
+    - Executor holds only a path to the worker script, not handler callables.
+    - The only path to handler invocation: IRBuilder.build() → Executor.execute()
+      → worker subprocess.
 
 Taint boundary:
-    - Sandbox.execute() returns TaintedValue.
+    - Executor.execute() returns TaintedValue (same interface as old Sandbox).
     - Next IRBuilder.build() requires TaintContext (not variadic, not optional).
     - Callers must explicitly construct TaintContext.clean() or
       TaintContext.from_outputs(prior_result) — taint cannot be dropped silently.
 
 Invariant:
-    If sandbox.execute(ir) is called, ir was produced by IRBuilder.build().
+    If executor.execute(ir) is called, ir was produced by IRBuilder.build().
     If IRBuilder.build() returned, all constraints were satisfied at construction.
     There are no runtime policy checks in the execution path.
+    The worker receives only an already-validated ExecutionSpec.
 
 Caller flow:
     from taint import TaintContext
@@ -51,7 +60,7 @@ Caller flow:
     # First action — no prior outputs, explicit clean context
     ctx1 = TaintContext.clean()
     ir1  = runtime.builder.build("read_data", source, {"query": "x"}, ctx1)
-    r1   = runtime.sandbox.execute(ir1)    # TaintedValue
+    r1   = runtime.sandbox.execute(ir1)    # TaintedValue — dispatches to worker
 
     # Chained action — taint carried forward structurally
     ctx2 = TaintContext.from_outputs(r1)
@@ -62,33 +71,36 @@ Caller flow:
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict
+from typing import Any
 
 from compile import CompiledPolicy, compile_world
 from channel import Channel
 from ir import IRBuilder
-from sandbox import Sandbox
+from executor import Executor
 
 
 class Runtime:
     """
-    Assembled runtime: compiled policy + channel factory + IR builder + sandbox.
+    Assembled runtime: compiled policy + channel factory + IR builder + executor.
 
     Immutable after construction. All components are derived from the same
     CompiledPolicy so trust assignments, capability matrix, and taint rules
     are consistent across channel resolution, IR construction, and execution.
+
+    The runtime holds NO callable handlers. Execution is delegated to a
+    worker subprocess via Executor.
     """
 
-    __slots__ = ("_policy", "_builder", "_sandbox")
+    __slots__ = ("_policy", "_builder", "_executor")
 
     def __init__(
         self,
         policy: CompiledPolicy,
-        handlers: Dict[str, Callable[[Dict[str, Any]], Any]],
+        executor: Executor,
     ) -> None:
         object.__setattr__(self, "_policy", policy)
         object.__setattr__(self, "_builder", IRBuilder(policy))
-        object.__setattr__(self, "_sandbox", Sandbox(handlers))
+        object.__setattr__(self, "_executor", executor)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("Runtime is immutable after construction")
@@ -109,9 +121,19 @@ class Runtime:
         return self._builder
 
     @property
-    def sandbox(self) -> Sandbox:
-        """The execution sandbox. Use sandbox.execute(ir) to run IntentIR."""
-        return self._sandbox
+    def sandbox(self) -> Executor:
+        """
+        The execution layer. Use sandbox.execute(ir) to run IntentIR.
+
+        Despite the name (kept for API compatibility), this is now an Executor
+        that dispatches to a worker subprocess. No handlers live here.
+        """
+        return self._executor
+
+    @property
+    def executor(self) -> Executor:
+        """The subprocess executor. Alias for sandbox."""
+        return self._executor
 
     @property
     def policy(self) -> CompiledPolicy:
@@ -123,30 +145,18 @@ def build_runtime(manifest_path: str = "world_manifest.yaml") -> Runtime:
     """
     Entry point: compile world manifest and return an assembled Runtime.
 
-    Handlers defined here are the ONLY tools that can ever be executed.
-    They are NOT passed to compile_world() — CompiledPolicy is pure metadata.
-    Handlers are passed directly to Sandbox, which is the sole execution layer.
+    No handlers are defined or held in the main process.
+    Execution is delegated to worker.py via Executor (subprocess boundary).
 
-    To add a tool: add it to world_manifest.yaml AND add a handler here.
-    A handler without a manifest entry is never reachable (IRBuilder rejects
-    unknown action names at construction). A manifest entry without a handler
-    causes Sandbox.execute() to raise KeyError (safe default).
+    To add a tool: add it to world_manifest.yaml AND add a handler in worker.py.
+    A handler in worker.py without a manifest entry is unreachable (IRBuilder
+    rejects unknown action names at construction). A manifest entry without a
+    worker handler causes the worker to return an error (safe default).
     """
     if not os.path.isabs(manifest_path):
-        # Resolve relative paths from the directory containing this file,
-        # not from the caller's working directory.
         manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), manifest_path)
 
-    handlers: Dict[str, Callable[[Dict[str, Any]], Any]] = {
-        "read_data":       lambda p: {"data": p.get("query", ""), "source": "db"},
-        "send_email":      lambda p: {"sent": True, "to": p.get("to", "")},
-        "download_report": lambda p: {"report": p.get("id", ""), "bytes": 0},
-        "post_webhook":    lambda p: {"status": 200, "url": p.get("url", "")},
-    }
-
-    # compile_world produces pure metadata — no handlers, no callable behavior.
     policy = compile_world(manifest_path)
+    executor = Executor()
 
-    # Runtime assembles policy (metadata) + handlers (execution) into one object.
-    # The handler dict never escapes Runtime; only Sandbox holds a reference.
-    return Runtime(policy, handlers)
+    return Runtime(policy, executor)
