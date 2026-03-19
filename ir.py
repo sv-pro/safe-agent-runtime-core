@@ -24,10 +24,21 @@ Construction-time constraint checking (IRBuilder.build):
       2. Capability: source trust level must permit the action type
          (O(1) frozenset lookup on compiled capability matrix)
       3. Approval: approval-required actions block construction
-         (no execution path exists without an approval token)
-      4. Taint propagation: taint is computed from input TaintedValues
-         (callers pass prior outputs — they cannot suppress taint)
+         (deferred — no approval token path yet; see APPROVAL_DEFERRED note)
+      4. Taint propagation: taint is computed from TaintContext
+         (callers must pass a TaintContext — cannot drop taint by omission)
       5. Taint rule: TAINTED + EXTERNAL → ConstructionError
+
+Taint threading (structural, not voluntary):
+    IRBuilder.build() requires a taint_context: TaintContext argument.
+    This is NOT variadic. Callers cannot omit it (TypeError if missing).
+
+    For the first action in a chain:   TaintContext.clean()
+    For chained actions with prior output: TaintContext.from_outputs(result)
+
+    This closes the taint-drop gap: in the old design, *input_taints was
+    variadic and callers could silently drop taint by passing zero args.
+    Now they must explicitly construct TaintContext — a deliberate act.
 
 Old flow:
     ActionRequest(action, source, params, taint)  # taint asserted by caller
@@ -35,21 +46,25 @@ Old flow:
     Evaluator.check(request)                       # string comparisons, loops
 
 New flow:
-    ir = builder.build(name, source, params, *prior_outputs)
-    # ↑ raises ConstructionError if any constraint fails
-    # If this line completes, the IR is valid — execution is unconditional
-    result = sandbox.execute(ir)
-    # ↑ pure execution, zero constraint checks
+    ctx = TaintContext.from_outputs(prior_result)  # taint derived, not asserted
+    ir  = builder.build(name, source, params, ctx) # raises ConstructionError if invalid
+    result = sandbox.execute(ir)                   # pure execution, TaintedValue out
+
+APPROVAL_DEFERRED:
+    Actions with approval_required=True currently raise ConstructionError at
+    build time. There is no ApprovalToken type yet. This is an honest dead end:
+    the feature is not faked (no "require_approval" string returned as if
+    something happened). Approval support is deferred to a future pass.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from compile import CompiledAction, CompiledPolicy
 from channel import Source
 from models import ActionType, ConstructionError, TaintState, TrustLevel
-from taint import TaintedValue
+from taint import TaintContext, TaintedValue
 
 
 # ── Module-private IR seal ────────────────────────────────────────────────────
@@ -66,10 +81,10 @@ class IntentIR:
     IntentIR object is proof that all constraints were satisfied at build time.
 
     Fields:
-        action  : CompiledAction  — the action to execute (sealed, compile-produced)
+        action  : CompiledAction  — the action descriptor (metadata only, no handler)
         source  : Source          — the requesting identity (channel-derived, sealed)
         params  : dict            — execution parameters
-        taint   : TaintState      — computed from input TaintedValues, not asserted
+        taint   : TaintState      — computed from TaintContext, not asserted by caller
     """
 
     __slots__ = ("action", "source", "params", "taint")
@@ -118,11 +133,18 @@ class IRBuilder:
     the IR is valid. If build() raises ConstructionError, the action is
     not representable — not denied at execution, not possible at all.
 
-    Taint propagation:
-        Pass prior TaintedValue outputs as *input_taints. The builder
-        computes the taint join automatically. Callers cannot suppress
-        taint by omitting inputs they received from prior sandbox.execute()
-        calls — the type system makes the propagation chain visible.
+    Taint propagation (structural):
+        Callers must pass a TaintContext derived from their prior outputs.
+        TaintContext is a required argument — not variadic, not optional.
+        A caller cannot casually drop taint by omitting arguments; they must
+        explicitly construct TaintContext.clean() to signal a fresh start.
+
+        For the first action in a chain (no prior output):
+            ctx = TaintContext.clean()
+
+        For chained actions (using data from a prior sandbox.execute()):
+            ctx = TaintContext.from_outputs(prior_result)
+            # or: ctx = TaintContext.from_outputs(result_a, result_b)
     """
 
     def __init__(self, policy: CompiledPolicy) -> None:
@@ -133,7 +155,7 @@ class IRBuilder:
         action_name: str,
         source: Source,
         params: Dict[str, Any],
-        *input_taints: TaintedValue,
+        taint_context: TaintContext,
     ) -> IntentIR:
         """
         Build an IntentIR or raise ConstructionError.
@@ -149,11 +171,11 @@ class IRBuilder:
             callers cannot fabricate a Source with an arbitrary trust level.
         params : dict
             Execution parameters passed to the action handler.
-        *input_taints : TaintedValue
-            Prior action outputs whose values are used in params. Taint is
-            propagated automatically via TaintedValue.join(). If any input
-            is TAINTED, the IR carries TAINTED taint, and the taint rule
-            check may raise ConstructionError.
+        taint_context : TaintContext
+            Required. Carries taint lineage from prior pipeline stages.
+            Use TaintContext.clean() for the first action in a chain.
+            Use TaintContext.from_outputs(*prior_results) for chained actions.
+            This argument is NOT optional — callers cannot drop taint by omission.
         """
         policy = self._policy
 
@@ -169,35 +191,30 @@ class IRBuilder:
             )
 
         # ── 2. Capability check (O(1) frozenset lookup) ────────────────────────
-        # Old: `if action_type.value not in capabilities[trust_level]` — string scan
-        # New: `if (trust_level, action_type) not in frozenset` — O(1), no strings
         if not policy.can_perform(source.trust_level, action.action_type):
             raise ConstructionError(
                 f"Trust level {source.trust_level.value!r} does not have capability "
                 f"for {action.action_type.value!r} actions — IR cannot be formed"
             )
 
-        # ── 3. Approval gate ───────────────────────────────────────────────────
+        # ── 3. Approval gate (deferred) ────────────────────────────────────────
         # Approval-required actions cannot be constructed without an approval token.
-        # The old system returned REQUIRE_APPROVAL and then raised at execution —
-        # a dead end with no path to success. Now it raises at construction.
-        # A real system would accept ApprovalToken as a parameter and verify it here.
+        # ApprovalToken is not yet implemented. This raises ConstructionError
+        # honestly — there is no success path through approval yet.
+        # See APPROVAL_DEFERRED in module docstring.
         if action.approval_required:
             raise ConstructionError(
                 f"Action {action_name!r} requires approval — "
-                f"IR construction blocked until an approval token is provided"
+                f"approval token support is deferred; IR construction blocked"
             )
 
-        # ── 4. Taint propagation ───────────────────────────────────────────────
-        # Compute taint from all prior TaintedValue outputs.
-        # Callers must pass their prior outputs here — they cannot suppress taint
-        # by "forgetting". The join is monotonic: CLEAN ∨ TAINTED = TAINTED.
-        computed_taint = TaintedValue.join(*input_taints)
+        # ── 4. Taint from TaintContext (structural, not voluntary) ─────────────
+        # Taint is read from the required TaintContext. The caller cannot omit
+        # it (Python raises TypeError). To suppress taint they must explicitly
+        # write TaintContext.clean() — a deliberate, visible, auditable act.
+        computed_taint = taint_context.taint
 
         # ── 5. Taint rule check ────────────────────────────────────────────────
-        # Old: `if taint.value == rule["taint"] and action_type.value == rule["action_type"]`
-        #       — string comparison against YAML-derived strings at runtime
-        # New: enum identity comparison against compiled TaintRule objects
         taint_rule = policy.taint_rule_for(computed_taint, action.action_type)
         if taint_rule is not None:
             raise ConstructionError(
