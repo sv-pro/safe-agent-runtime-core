@@ -1,30 +1,13 @@
 """
-Demo: Ontological Runtime — "impossible instead of deny"
+Ontology runtime demo — three scenarios.
 
-Old system flow:
-    registry.get("send_email")               # string lookup, raises at get()
-    ActionRequest(source=Source("user"),     # caller claims trust
-                  taint=TaintState.TAINTED)  # caller asserts taint
-    runtime.execute(request)                 # checks at execution time
+This prototype demonstrates a constrained action world where undefined actions
+cannot be constructed and tainted data cannot trigger external side effects.
 
-New system flow:
-    channel = runtime.channel("user")        # trust from compiled map
-    source  = channel.source                 # sealed — cannot be fabricated
-    ir = runtime.builder.build(              # ALL checks at construction time
-        "send_email", source, params, *prior_outputs
-    )
-    result = runtime.sandbox.execute(ir)     # pure execution, zero checks
-
-Scenarios:
-  A) Undefined action    — build() raises before any execution path
-  B) Sealed Source       — Source() constructor raises TypeError
-  C) Taint propagation   — builder computes taint from prior outputs,
-                            raises ConstructionError (trusted user, tainted input, external)
-  D) Capability boundary — untrusted source, external action → ConstructionError at build
-  E) Allowed execution   — happy path, returns TaintedValue
-  F) Approval gate       — approval_required → ConstructionError at build
-  G) Taint output        — taint propagates to output TaintedValue
+Run:  python demo.py
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -33,111 +16,80 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from models import ConstructionError, TaintState, TrustLevel
-from taint import TaintedValue
-from channel import Source
-from runtime import build_runtime
+from src.errors import ImpossibleActionError, UnknownActionError
+from src.runtime import Runtime
+from src.world_loader import load_world
+
+registry, world = load_world(os.path.join(_ROOT, "world.yaml"))
+runtime = Runtime(world)
+
+SEP = "=" * 60
 
 
-def run(label: str, fn):
-    print(f"[{label}]")
-    try:
-        result = fn()
-        print(f"  outcome : EXECUTED")
-        print(f"  result  : {result}")
-    except ConstructionError as e:
-        print(f"  outcome : ConstructionError (IR impossible — not denied)")
-        print(f"  reason  : {e.reason}")
-    except TypeError as e:
-        print(f"  outcome : TypeError (structural seal violated)")
-        print(f"  reason  : {e}")
-    print()
+# ── Demo 1: Ontological absence ────────────────────────────────────────────────
+#
+# Attempt to construct an action that does not exist in the ontology.
+# Expected: UnknownActionError raised at construction — no execution path entered.
+# This is not a runtime denial. The action cannot be represented at all.
+
+print(SEP)
+print("DEMO 1 — Ontological absence")
+print("Attempting to construct: delete_repository")
+print("-" * 60)
+try:
+    req = registry.build_request("delete_repository", source="user", params={})
+    print("BUG: should not reach here")
+except UnknownActionError as e:
+    print(f"UnknownActionError : {e}")
+    print("Result             : action does not exist in this world — construction failed")
+print()
 
 
-def main():
-    runtime = build_runtime("world_manifest.yaml")
+# ── Demo 2: Taint containment ──────────────────────────────────────────────────
+#
+# Trusted source (system) with explicit taint=True attempts an external action.
+# Capability check passes (trusted → [internal, external]).
+# Taint check fires: tainted data cannot cross external boundary.
+# This proves taint is real physics, not a guardrail label.
 
-    # ── A: Undefined action — IR cannot be constructed ─────────────────────────
-    # "delete_repository" is not in world_manifest.yaml.
-    # builder.build() raises ConstructionError at construction.
-    # No execution path is entered. The action does not exist — it is not denied.
-    def demo_a():
-        source = runtime.channel("user").source
-        return runtime.builder.build("delete_repository", source, {})
-
-    run("A — Undefined action: IR construction impossible", demo_a)
-
-    # ── B: Sealed Source — cannot fabricate trust ──────────────────────────────
-    # Old: Source("user") — any caller could claim any identity.
-    # New: Source() raises TypeError — trust is derived from channel, not caller.
-    print("[B — Sealed Source: direct construction raises TypeError]")
-    try:
-        Source(trust_level=TrustLevel.TRUSTED, identity="attacker")
-        print("  BUG: Source construction should have raised")
-    except TypeError as e:
-        print(f"  Source(trust_level=TRUSTED, identity='attacker') → TypeError")
-        print(f"  reason  : {e}")
-    print()
-
-    # ── C: Taint propagation — trusted user, tainted output used as input ──────
-    # Step 1: simulate a tainted result (data from an external source).
-    # Step 2: trusted user tries to use tainted data in an external action.
-    # Taint is propagated from the prior output — caller cannot suppress it.
-    def demo_c():
-        tainted_read_result = TaintedValue(
-            value={"data": "<externally-injected content>"},
-            taint=TaintState.TAINTED,
-        )
-        source = runtime.channel("user").source  # TRUSTED
-        return runtime.builder.build(
-            "send_email",
-            source,
-            {"to": "target@example.com"},
-            tainted_read_result,  # taint propagated from this prior output
-        )
-
-    run("C — Taint propagation: trusted user + tainted input + external action", demo_c)
-
-    # ── D: Capability boundary — untrusted cannot reach external actions ────────
-    # Old: runtime.execute() checked at execution time.
-    # New: builder.build() raises ConstructionError at construction.
-    def demo_d():
-        source = runtime.channel("external").source  # UNTRUSTED
-        return runtime.builder.build("send_email", source, {"to": "x@y.com"})
-
-    run("D — Capability boundary: untrusted source, external action", demo_d)
-
-    # ── E: Allowed execution — happy path ──────────────────────────────────────
-    def demo_e():
-        source = runtime.channel("user").source
-        ir = runtime.builder.build("read_data", source, {"query": "SELECT *"})
-        return runtime.sandbox.execute(ir)
-
-    run("E — Allowed execution: trusted user, clean data, internal action", demo_e)
-
-    # ── F: Approval gate at construction ──────────────────────────────────────
-    # Old: Evaluator returned REQUIRE_APPROVAL → Runtime raised. Dead end (no path to success).
-    # New: IRBuilder raises at build time with a message indicating what is needed.
-    def demo_f():
-        source = runtime.channel("user").source
-        return runtime.builder.build("download_report", source, {"id": "r-001"})
-
-    run("F — Approval gate: construction blocked until approval token provided", demo_f)
-
-    # ── G: Taint propagation to output ────────────────────────────────────────
-    print("[G — Taint output: taint propagates through sandbox to result]")
-    source = runtime.channel("user").source
-    tainted_input = TaintedValue(value={"q": "user data"}, taint=TaintState.TAINTED)
-    # Internal action + tainted input is allowed (taint rule only blocks EXTERNAL)
-    ir = runtime.builder.build("read_data", source, {"query": "x"}, tainted_input)
-    result = runtime.sandbox.execute(ir)
-    print(f"  ir.taint     : {ir.taint.value!r}    ← propagated from tainted_input")
-    print(f"  result.taint : {result.taint.value!r} ← propagated to output")
-    print(f"  result.value : {result.value}")
-    print()
-
-    print("Demo complete.")
+print(SEP)
+print("DEMO 2 — Taint containment")
+print("source=system (trusted), taint=True, action=send_email (external)")
+print("-" * 60)
+try:
+    req = registry.build_request(
+        "send_email",
+        source="system",
+        params={"to": "target@example.com", "body": "message"},
+        taint=True,
+    )
+    result = runtime.execute(req)
+    print(f"BUG: should not reach here, got: {result}")
+except ImpossibleActionError as e:
+    print(f"ImpossibleActionError : {e}")
+    print("Result               : taint blocks external boundary crossing — not a guardrail, a law")
+print()
 
 
-if __name__ == "__main__":
-    main()
+# ── Demo 3: Allowed tainted internal action ────────────────────────────────────
+#
+# External source (auto-tainted by tainted_sources rule) requests summarize.
+# summarize is internal → taint rule does not fire.
+# Action executes normally. Not everything tainted is impossible —
+# only tainted + external is impossible.
+
+print(SEP)
+print("DEMO 3 — Allowed tainted internal action")
+print("source=external (auto-tainted), action=summarize (internal)")
+print("-" * 60)
+req = registry.build_request(
+    "summarize",
+    source="external",
+    params={"content": "some content from an external user"},
+)
+result = runtime.execute(req)
+print(f"Decision : {result.decision}")
+print(f"Output   : {result.output}")
+print("Result   : tainted internal action executes — only tainted boundary crossing is impossible")
+print()
+print("Demo complete.")
