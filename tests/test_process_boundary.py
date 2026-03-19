@@ -23,13 +23,13 @@ from unittest.mock import patch
 
 import pytest
 
-from executor import Executor, ExecutionSpec
-from models import ConstructionError, TaintState
 from runtime import build_runtime
-from taint import TaintContext, TaintedValue
+from runtime.executor import Executor, ExecutionSpec
+from runtime.models import ConstructionError, TaintState
+from runtime.taint import TaintContext, TaintedValue
 
 MANIFEST = os.path.join(os.path.dirname(__file__), "..", "world_manifest.yaml")
-WORKER = os.path.join(os.path.dirname(__file__), "..", "worker.py")
+WORKER = os.path.join(os.path.dirname(__file__), "..", "runtime", "worker.py")
 
 
 @pytest.fixture(scope="module")
@@ -135,9 +135,8 @@ def test_runtime_holds_no_callable_handlers(rt):
     """
     The Runtime and its Executor hold no handler callables.
 
-    - rt.sandbox is an Executor (not a Sandbox with a __handlers dict)
+    - rt.sandbox is an Executor
     - Executor has no _handlers attribute
-    - Executor has no __handlers attribute (name-mangled or otherwise)
     - policy.actions["read_data"] has no callable handler
     """
     executor = rt.sandbox

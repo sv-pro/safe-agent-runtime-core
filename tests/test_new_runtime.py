@@ -1,5 +1,5 @@
 """
-Tests for the new ontology runtime (compile / ir / sandbox / runtime).
+Tests for the ontology runtime (runtime package).
 
 Six focused properties:
 
@@ -18,9 +18,9 @@ from __future__ import annotations
 import os
 import pytest
 
-from models import ConstructionError, TaintState
 from runtime import build_runtime
-from taint import TaintContext, TaintedValue
+from runtime.models import ConstructionError, TaintState
+from runtime.taint import TaintContext, TaintedValue
 
 MANIFEST = os.path.join(os.path.dirname(__file__), "..", "world_manifest.yaml")
 
@@ -35,7 +35,7 @@ def rt():
 def test_unknown_action_fails_at_construction(rt):
     """
     Action names not in the ontology raise ConstructionError at IRBuilder.build().
-    No IntentIR is produced; Sandbox.execute() is never called.
+    No IntentIR is produced; Executor.execute() is never called.
     The action does not exist in this world — it is impossible, not denied.
     """
     channel = rt.channel("user")
@@ -54,17 +54,17 @@ def test_compiled_action_has_no_invoke(rt):
     - _handler does not exist on CompiledAction (AttributeError)
 
     The execution boundary is closed: the only path to a handler is
-    Sandbox.execute(ir) with a validly constructed IntentIR.
+    Executor.execute(ir) with a validly constructed IntentIR.
     """
     action = rt.policy.actions["read_data"]
 
     assert not hasattr(action, "_invoke"), (
         "CompiledAction must not expose _invoke(); "
-        "execution must go through Sandbox.execute(ir)"
+        "execution must go through Executor.execute(ir)"
     )
     assert not hasattr(action, "_handler"), (
         "CompiledAction must not expose _handler; "
-        "handlers are private to Sandbox"
+        "handlers are private to the worker subprocess"
     )
 
 
@@ -115,7 +115,7 @@ def test_tainted_external_action_fails_at_construction(rt):
     Tainted data used for an EXTERNAL action raises ConstructionError.
 
     The taint rule fires at IRBuilder.build() — before any execution path
-    is entered. Sandbox.execute() is never reached.
+    is entered. Executor.execute() is never reached.
 
     This proves taint is real physics: the IR cannot be formed, not just
     rejected at execution time.
@@ -139,11 +139,6 @@ def test_taint_context_required_not_variadic(rt):
     """
     IRBuilder.build() requires a TaintContext argument.
 
-    In the old design, *input_taints was variadic — callers could call
-    builder.build(name, source, params) with no taint arguments and silently
-    drop taint from prior outputs.
-
-    In the new design, taint_context is a required positional argument.
     Omitting it raises TypeError at the call site, not silently.
     """
     channel = rt.channel("user")

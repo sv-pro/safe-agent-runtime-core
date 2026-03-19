@@ -156,14 +156,14 @@ Result     : TaintedValue(taint='clean', value={'data': 'sales Q1', 'source': 'd
 | File | Role |
 |---|---|
 | `world_manifest.yaml` | Declares actions, trust, capabilities, taint rules |
-| `compile.py` | Compiles manifest into frozen `CompiledPolicy` at startup |
-| `channel.py` | `Channel` + sealed `Source` — trust from compiled map, not caller-supplied |
-| `models.py` | Primitive enums: `TaintState`, `ActionType`, `TrustLevel`, `ConstructionError` |
-| `taint.py` | `TaintedValue[T]`, `TaintContext` — structural taint propagation |
-| `ir.py` | Sealed `IntentIR` + `IRBuilder` — all constraint checking at construction |
-| `executor.py` | `Executor` — subprocess transport facade, no handlers |
-| `worker.py` | Standalone subprocess; owns all handlers; closed registry |
-| `runtime.py` | `build_runtime()` — wires everything together |
+| `runtime/models.py` | Primitive enums: `TaintState`, `ActionType`, `TrustLevel`, `ConstructionError` |
+| `runtime/compile.py` | Compiles manifest into frozen `CompiledPolicy` at startup |
+| `runtime/channel.py` | `Channel` + sealed `Source` — trust from compiled map, not caller-supplied |
+| `runtime/taint.py` | `TaintedValue[T]`, `TaintContext` — structural taint propagation |
+| `runtime/ir.py` | Sealed `IntentIR` + `IRBuilder` — all constraint checking at construction |
+| `runtime/executor.py` | `Executor` — subprocess transport facade, no handlers |
+| `runtime/worker.py` | Standalone subprocess; owns all handlers; closed registry |
+| `runtime/runtime.py` | `build_runtime()` — wires everything together |
 | `demo.py` | Three scenarios: unknown action, taint block, subprocess execution |
 
 ---

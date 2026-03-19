@@ -15,56 +15,25 @@ Sealing:
 Construction-time constraint checking (IRBuilder.build):
     All constraint evaluation happens HERE — at IR construction time.
     If build() raises ConstructionError, no execution path is entered.
-    If build() returns an IntentIR, the action is valid and Sandbox
+    If build() returns an IntentIR, the action is valid and the Executor
     executes it without re-checking any constraint.
 
     Constraints checked at construction:
       1. Ontological: action must exist in compiled policy
-         (undefined action → ConstructionError, not runtime denial)
       2. Capability: source trust level must permit the action type
-         (O(1) frozenset lookup on compiled capability matrix)
-      3. Approval: approval-required actions block construction
-         (deferred — no approval token path yet; see APPROVAL_DEFERRED note)
-      4. Taint propagation: taint is computed from TaintContext
-         (callers must pass a TaintContext — cannot drop taint by omission)
+      3. Approval: approval-required actions block construction (deferred)
+      4. Taint propagation: taint is computed from required TaintContext
       5. Taint rule: TAINTED + EXTERNAL → ConstructionError
-
-Taint threading (structural, not voluntary):
-    IRBuilder.build() requires a taint_context: TaintContext argument.
-    This is NOT variadic. Callers cannot omit it (TypeError if missing).
-
-    For the first action in a chain:   TaintContext.clean()
-    For chained actions with prior output: TaintContext.from_outputs(result)
-
-    This closes the taint-drop gap: in the old design, *input_taints was
-    variadic and callers could silently drop taint by passing zero args.
-    Now they must explicitly construct TaintContext — a deliberate act.
-
-Old flow:
-    ActionRequest(action, source, params, taint)  # taint asserted by caller
-    Runtime.execute(request)                       # runtime checks at execution
-    Evaluator.check(request)                       # string comparisons, loops
-
-New flow:
-    ctx = TaintContext.from_outputs(prior_result)  # taint derived, not asserted
-    ir  = builder.build(name, source, params, ctx) # raises ConstructionError if invalid
-    result = sandbox.execute(ir)                   # pure execution, TaintedValue out
-
-APPROVAL_DEFERRED:
-    Actions with approval_required=True currently raise ConstructionError at
-    build time. There is no ApprovalToken type yet. This is an honest dead end:
-    the feature is not faked (no "require_approval" string returned as if
-    something happened). Approval support is deferred to a future pass.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from compile import CompiledAction, CompiledPolicy
-from channel import Source
-from models import ActionType, ConstructionError, TaintState, TrustLevel
-from taint import TaintContext, TaintedValue
+from .compile import CompiledAction, CompiledPolicy
+from .channel import Source
+from .models import ActionType, ConstructionError, TaintState, TrustLevel
+from .taint import TaintContext, TaintedValue
 
 
 # ── Module-private IR seal ────────────────────────────────────────────────────
@@ -132,19 +101,6 @@ class IRBuilder:
     All constraint checking happens inside build(). If build() returns,
     the IR is valid. If build() raises ConstructionError, the action is
     not representable — not denied at execution, not possible at all.
-
-    Taint propagation (structural):
-        Callers must pass a TaintContext derived from their prior outputs.
-        TaintContext is a required argument — not variadic, not optional.
-        A caller cannot casually drop taint by omitting arguments; they must
-        explicitly construct TaintContext.clean() to signal a fresh start.
-
-        For the first action in a chain (no prior output):
-            ctx = TaintContext.clean()
-
-        For chained actions (using data from a prior sandbox.execute()):
-            ctx = TaintContext.from_outputs(prior_result)
-            # or: ctx = TaintContext.from_outputs(result_a, result_b)
     """
 
     def __init__(self, policy: CompiledPolicy) -> None:
@@ -163,26 +119,17 @@ class IRBuilder:
         Parameters
         ----------
         action_name : str
-            The name of the action to execute. Must be present in the compiled
-            policy — otherwise ConstructionError is raised before any execution
-            path is entered.
+            Must be present in the compiled policy.
         source : Source
-            The requesting Source. Must be obtained through Channel.source —
-            callers cannot fabricate a Source with an arbitrary trust level.
+            Must be obtained through Channel.source.
         params : dict
             Execution parameters passed to the action handler.
         taint_context : TaintContext
-            Required. Carries taint lineage from prior pipeline stages.
-            Use TaintContext.clean() for the first action in a chain.
-            Use TaintContext.from_outputs(*prior_results) for chained actions.
-            This argument is NOT optional — callers cannot drop taint by omission.
+            Required. Cannot be omitted — callers cannot drop taint silently.
         """
         policy = self._policy
 
         # ── 1. Ontological check ───────────────────────────────────────────────
-        # The action must exist in the compiled policy. This is not a runtime
-        # denial — the action does not exist in this ontology. ConstructionError
-        # is raised before any execution path is entered.
         action = policy.get_action(action_name)
         if action is None:
             raise ConstructionError(
@@ -198,10 +145,6 @@ class IRBuilder:
             )
 
         # ── 3. Approval gate (deferred) ────────────────────────────────────────
-        # Approval-required actions cannot be constructed without an approval token.
-        # ApprovalToken is not yet implemented. This raises ConstructionError
-        # honestly — there is no success path through approval yet.
-        # See APPROVAL_DEFERRED in module docstring.
         if action.approval_required:
             raise ConstructionError(
                 f"Action {action_name!r} requires approval — "
@@ -209,9 +152,6 @@ class IRBuilder:
             )
 
         # ── 4. Taint from TaintContext (structural, not voluntary) ─────────────
-        # Taint is read from the required TaintContext. The caller cannot omit
-        # it (Python raises TypeError). To suppress taint they must explicitly
-        # write TaintContext.clean() — a deliberate, visible, auditable act.
         computed_taint = taint_context.taint
 
         # ── 5. Taint rule check ────────────────────────────────────────────────

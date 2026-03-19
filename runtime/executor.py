@@ -2,11 +2,7 @@
 Executor
 ========
 
-Subprocess transport facade. Replaces Sandbox as the execution layer.
-
-Architecture change:
-  Old: Sandbox(handlers).execute(ir)  → handler(ir.params) in-process
-  New: Executor().execute(ir)         → worker subprocess via stdin/stdout
+Subprocess transport facade. The execution layer.
 
 The Executor holds NO handler functions. It holds only a path to the worker
 script. Execution happens in a separate process; callable code is unreachable
@@ -36,8 +32,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from ir import IntentIR
-from taint import TaintedValue
+from .ir import IntentIR
+from .taint import TaintedValue
 
 
 # ── ExecutionSpec ─────────────────────────────────────────────────────────────
@@ -89,7 +85,7 @@ class Executor:
         Creates an ExecutionSpec from the IR, sends it to the worker via stdin,
         reads the JSON response from stdout, and returns a TaintedValue.
 
-        The taint from the IR is preserved in the output (same as Sandbox did).
+        The taint from the IR is preserved in the output.
         """
         spec = ExecutionSpec.from_ir(ir)
         raw_result = self._call_worker(spec)

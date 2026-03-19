@@ -32,39 +32,23 @@ Process boundary:
     - worker.py runs in a separate process and owns the real handlers.
     - The main process cannot call handler functions directly.
 
-Execution boundary:
-    - CompiledPolicy exposes CompiledAction metadata objects (no handlers, no _invoke).
-    - Executor holds only a path to the worker script, not handler callables.
-    - The only path to handler invocation: IRBuilder.build() → Executor.execute()
-      → worker subprocess.
-
-Taint boundary:
-    - Executor.execute() returns TaintedValue (same interface as old Sandbox).
-    - Next IRBuilder.build() requires TaintContext (not variadic, not optional).
-    - Callers must explicitly construct TaintContext.clean() or
-      TaintContext.from_outputs(prior_result) — taint cannot be dropped silently.
-
-Invariant:
-    If executor.execute(ir) is called, ir was produced by IRBuilder.build().
-    If IRBuilder.build() returned, all constraints were satisfied at construction.
-    There are no runtime policy checks in the execution path.
-    The worker receives only an already-validated ExecutionSpec.
+Execution path:
+    demo.py → IRBuilder → Runtime → ExecutionSpec → Executor → worker subprocess
 
 Caller flow:
-    from taint import TaintContext
+    from runtime import build_runtime
+    from runtime.taint import TaintContext
 
-    runtime = build_runtime()
-    channel = runtime.channel("user")       # trust from compiled map
-    source  = channel.source               # sealed — cannot be fabricated
+    rt = build_runtime()
+    channel = rt.channel("user")       # trust from compiled map
+    source  = channel.source           # sealed — cannot be fabricated
 
-    # First action — no prior outputs, explicit clean context
     ctx1 = TaintContext.clean()
-    ir1  = runtime.builder.build("read_data", source, {"query": "x"}, ctx1)
-    r1   = runtime.sandbox.execute(ir1)    # TaintedValue — dispatches to worker
+    ir1  = rt.builder.build("read_data", source, {"query": "x"}, ctx1)
+    r1   = rt.sandbox.execute(ir1)     # TaintedValue — dispatches to worker
 
-    # Chained action — taint carried forward structurally
     ctx2 = TaintContext.from_outputs(r1)
-    ir2  = runtime.builder.build("send_email", source, {...}, ctx2)
+    ir2  = rt.builder.build("send_email", source, {...}, ctx2)
     # ↑ raises ConstructionError if r1 was TAINTED and send_email is EXTERNAL
 """
 
@@ -73,10 +57,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from compile import CompiledPolicy, compile_world
-from channel import Channel
-from ir import IRBuilder
-from executor import Executor
+from .compile import CompiledPolicy, compile_world
+from .channel import Channel
+from .ir import IRBuilder
+from .executor import Executor
 
 
 class Runtime:
@@ -122,12 +106,7 @@ class Runtime:
 
     @property
     def sandbox(self) -> Executor:
-        """
-        The execution layer. Use sandbox.execute(ir) to run IntentIR.
-
-        Despite the name (kept for API compatibility), this is now an Executor
-        that dispatches to a worker subprocess. No handlers live here.
-        """
+        """The execution layer. Use sandbox.execute(ir) to run IntentIR."""
         return self._executor
 
     @property
@@ -147,14 +126,13 @@ def build_runtime(manifest_path: str = "world_manifest.yaml") -> Runtime:
 
     No handlers are defined or held in the main process.
     Execution is delegated to worker.py via Executor (subprocess boundary).
-
-    To add a tool: add it to world_manifest.yaml AND add a handler in worker.py.
-    A handler in worker.py without a manifest entry is unreachable (IRBuilder
-    rejects unknown action names at construction). A manifest entry without a
-    worker handler causes the worker to return an error (safe default).
     """
     if not os.path.isabs(manifest_path):
-        manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), manifest_path)
+        # Default: look for manifest in the project root (parent of this package)
+        manifest_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            manifest_path,
+        )
 
     policy = compile_world(manifest_path)
     executor = Executor()
