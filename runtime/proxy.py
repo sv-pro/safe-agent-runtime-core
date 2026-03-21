@@ -25,7 +25,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .models import ConstructionError, TaintState
+from .models import (
+    ApprovalRequired,
+    ConstraintViolation,
+    ConstructionError,
+    NonExistentAction,
+    TaintState,
+    TaintViolation,
+)
 from .taint import TaintContext
 from .protocol import ProxyResponse, ToolRequest
 from .runtime import Runtime
@@ -92,6 +99,7 @@ class SafeMCPProxy:
             return ProxyResponse(
                 status="impossible",
                 reason=f"tool '{req.tool}' does not exist in this world",
+                denial_kind="non_existent_action",
             )
 
         # ── Step 2: Resolve source identity to a trust-bearing Channel ────────
@@ -121,7 +129,36 @@ class SafeMCPProxy:
             ir = self._runtime.builder.build(
                 action_name, source, req.params, taint_ctx
             )
+        except ApprovalRequired as exc:
+            return ProxyResponse(
+                status="require_approval",
+                action=action_name,
+                reason=exc.reason,
+                denial_kind="approval_required",
+            )
+        except NonExistentAction as exc:
+            return ProxyResponse(
+                status="impossible",
+                action=action_name,
+                reason=exc.reason,
+                denial_kind="non_existent_action",
+            )
+        except ConstraintViolation as exc:
+            return ProxyResponse(
+                status="impossible",
+                action=action_name,
+                reason=exc.reason,
+                denial_kind="constraint_violation",
+            )
+        except TaintViolation as exc:
+            return ProxyResponse(
+                status="impossible",
+                action=action_name,
+                reason=exc.reason,
+                denial_kind="taint_violation",
+            )
         except ConstructionError as exc:
+            # Catch-all for any future ConstructionError subclasses.
             return ProxyResponse(
                 status="impossible",
                 action=action_name,

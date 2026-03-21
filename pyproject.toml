@@ -5,12 +5,12 @@ build-backend = "setuptools.backends.legacy:build"
 [project]
 name = "safe-agent-runtime-core"
 version = "0.1.0"
-description = "Ontological AI agent runtime with construction-time safety constraints"
+description = "Deterministic policy kernel: taint propagation, capability enforcement, construction-time safety"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "safe-agent-runtime-core contributors" }]
-keywords = ["agent", "runtime", "safety", "taint", "ontology", "ai"]
+keywords = ["runtime", "kernel", "policy", "taint", "deterministic", "agent-safety"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

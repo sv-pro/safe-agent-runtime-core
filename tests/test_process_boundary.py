@@ -25,7 +25,7 @@ import pytest
 
 from runtime import build_runtime
 from runtime.executor import Executor, ExecutionSpec
-from runtime.models import ConstructionError, TaintState
+from runtime.models import ConstructionError, NonExistentAction, TaintViolation, TaintState
 from runtime.taint import TaintContext, TaintedValue
 
 MANIFEST = os.path.join(os.path.dirname(__file__), "..", "world_manifest.yaml")
@@ -55,7 +55,7 @@ def test_unknown_action_fails_before_worker(rt):
         return original_call_worker(self, spec)
 
     with patch.object(Executor, "_call_worker", counting_call_worker):
-        with pytest.raises(ConstructionError, match="does not exist in the compiled policy"):
+        with pytest.raises(NonExistentAction, match="does not exist in the compiled policy"):
             rt.builder.build("delete_repository", source, {}, TaintContext.clean())
 
     assert call_counter["count"] == 0, (
@@ -84,7 +84,7 @@ def test_tainted_external_fails_before_worker(rt):
         return original_call_worker(self, spec)
 
     with patch.object(Executor, "_call_worker", counting_call_worker):
-        with pytest.raises(ConstructionError, match="[Tt]aint"):
+        with pytest.raises(TaintViolation, match="[Tt]aint"):
             rt.builder.build("post_webhook", source, {"url": "https://x.com"}, ctx)
 
     assert call_counter["count"] == 0, (

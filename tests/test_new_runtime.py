@@ -19,7 +19,13 @@ import os
 import pytest
 
 from runtime import build_runtime
-from runtime.models import ConstructionError, TaintState
+from runtime.models import (
+    ApprovalRequired,
+    ConstructionError,
+    NonExistentAction,
+    TaintState,
+    TaintViolation,
+)
 from runtime.taint import TaintContext, TaintedValue
 
 MANIFEST = os.path.join(os.path.dirname(__file__), "..", "world_manifest.yaml")
@@ -40,7 +46,7 @@ def test_unknown_action_fails_at_construction(rt):
     """
     channel = rt.channel("user")
     source = channel.source
-    with pytest.raises(ConstructionError, match="does not exist in the compiled policy"):
+    with pytest.raises(NonExistentAction, match="does not exist in the compiled policy"):
         rt.builder.build("delete_repository", source, {}, TaintContext.clean())
 
 
@@ -129,7 +135,7 @@ def test_tainted_external_action_fails_at_construction(rt):
     )
     ctx = TaintContext.from_outputs(tainted_prior)
 
-    with pytest.raises(ConstructionError, match="[Tt]aint"):
+    with pytest.raises(TaintViolation, match="[Tt]aint"):
         rt.builder.build("post_webhook", source, {"url": "https://x.com"}, ctx)
 
 
@@ -175,7 +181,7 @@ def test_approval_required_raises_construction_error(rt):
     channel = rt.channel("user")
     source = channel.source
 
-    with pytest.raises(ConstructionError, match="approval"):
+    with pytest.raises(ApprovalRequired, match="approval"):
         rt.builder.build("download_report", source, {"id": "q1"}, TaintContext.clean())
 
 

@@ -2,7 +2,7 @@
 Proxy Protocol Types
 ====================
 
-Defines the thin surface between external tool requests and the ontology runtime.
+Defines the thin surface between external tool requests and the runtime kernel.
 
 ToolRequest   — incoming dict from an agent/LLM client (proxy input format)
 ProxyResponse — structured result returned to the caller
@@ -13,7 +13,16 @@ typed model. The proxy layer uses them; the runtime core never sees them.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
+
+
+# Typed denial kinds — distinguishable without parsing the reason string.
+DenialKind = Literal[
+    "non_existent_action",  # tool/action not registered in the ontology
+    "constraint_violation",  # trust-level / capability mismatch
+    "taint_violation",       # tainted data cannot flow into this action
+    "approval_required",     # action needs an approval token (deferred)
+]
 
 
 class ToolRequest:
@@ -62,12 +71,17 @@ class ProxyResponse:
 
     status values:
         "ok"               — action executed successfully; result is available
-        "impossible"       — action cannot be constructed (ontological absence,
-                             taint violation, or capability mismatch)
+        "impossible"       — action cannot be constructed; denial_kind says why
         "require_approval" — action requires approval (deferred in this runtime)
+
+    denial_kind (set when status != "ok"):
+        "non_existent_action"  — tool/action not registered in the policy
+        "constraint_violation" — trust-level or capability check failed
+        "taint_violation"      — tainted data cannot reach this action
+        "approval_required"    — action needs approval token (not yet supported)
     """
 
-    __slots__ = ("status", "action", "result", "reason")
+    __slots__ = ("status", "action", "result", "reason", "denial_kind")
 
     def __init__(
         self,
@@ -75,11 +89,13 @@ class ProxyResponse:
         action: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
         reason: Optional[str] = None,
+        denial_kind: Optional[DenialKind] = None,
     ) -> None:
         self.status = status
         self.action = action
         self.result = result
         self.reason = reason
+        self.denial_kind = denial_kind
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"status": self.status}
@@ -89,6 +105,8 @@ class ProxyResponse:
             d["result"] = self.result
         if self.reason is not None:
             d["reason"] = self.reason
+        if self.denial_kind is not None:
+            d["denial_kind"] = self.denial_kind
         return d
 
     def __repr__(self) -> str:
