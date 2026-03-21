@@ -1,16 +1,16 @@
 """
-Base types for the ontological runtime.
+Base types for the runtime kernel.
 
-This module contains only primitive enumerations and the construction error.
+This module contains only primitive enumerations and construction errors.
 It has no imports from other runtime modules — it is the foundation layer.
 
 Design notes:
-  - TrustLevel replaces the old string-based trust map lookups.
+  - TrustLevel replaces old string-based trust map lookups.
   - TaintState.join() makes taint monotonic and composable.
-  - ConstructionError replaces ImpossibleActionError: the name change is
-    intentional. The old name implied a runtime denial ("the action is
-    impossible"). The new name describes what actually happens: the IR
-    cannot be constructed. The failure is at build time, not execution time.
+  - ConstructionError is the base class for all IR construction failures.
+  - Typed subclasses (NonExistentAction, ConstraintViolation, TaintViolation,
+    ApprovalRequired) let callers distinguish denial reasons without parsing
+    message strings. Catching ConstructionError still works — it is the base.
 """
 
 from enum import Enum
@@ -46,19 +46,65 @@ class TrustLevel(Enum):
     UNTRUSTED = "untrusted"
 
 
+# ── Construction errors ───────────────────────────────────────────────────────
+#
+# All are subclasses of ConstructionError so callers can catch the base class
+# without caring about the specific reason. Typed subclasses are available for
+# callers that need to distinguish denial reasons without parsing strings.
+
+
 class ConstructionError(Exception):
     """
-    Raised when an IntentIR cannot be constructed.
+    Base: raised when an IntentIR cannot be constructed.
 
     This is NOT a runtime denial. The IR cannot be formed because the
     requested combination of (action, trust, taint) is not representable
-    in the compiled policy.
+    in the compiled policy. No execution path is entered.
 
-    The action is impossible in this context — not forbidden at execution
-    time. There is no execution-time check to bypass because execution
-    is never reached.
+    Subclasses carry the specific reason:
+      NonExistentAction  — action name not in the registered ontology
+      ConstraintViolation — trust/capability constraint not satisfied
+      TaintViolation     — taint rule fired (tainted data → external action)
+      ApprovalRequired   — action requires an approval token (not yet supported)
     """
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(f"ConstructionError: {reason}")
+
+
+class NonExistentAction(ConstructionError):
+    """
+    The action name is not registered in the compiled policy.
+
+    This is an ontological absence, not a policy denial. The action does
+    not exist in this world — it cannot be represented as an IntentIR.
+    """
+
+
+class ConstraintViolation(ConstructionError):
+    """
+    The source's trust level does not satisfy the action's capability requirement.
+
+    The action exists but the requesting source cannot perform it given
+    the compiled capability matrix.
+    """
+
+
+class TaintViolation(ConstructionError):
+    """
+    A taint rule fired: tainted data cannot flow into this action.
+
+    Typically: TAINTED context + EXTERNAL action → TaintViolation.
+    The IR cannot be formed because construction would violate the taint policy.
+    """
+
+
+class ApprovalRequired(ConstructionError):
+    """
+    The action requires an approval token, which is not yet supported.
+
+    This is an honest dead end: the feature is deferred. The action exists
+    and the capability check passes, but construction is blocked until an
+    approval mechanism is implemented.
+    """

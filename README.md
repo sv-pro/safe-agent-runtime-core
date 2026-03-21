@@ -1,237 +1,248 @@
 # safe-agent-runtime-core
 
-> A minimal deterministic runtime that makes unsafe actions structurally impossible.
+A deterministic policy kernel for agent execution pipelines.
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-
----
-
-## What this is
-
-Most agent safety systems filter actions at execution time — the action is formed as a request, a policy intercepts it, a decision is made. This repo takes a different approach: **actions not declared in the manifest cannot be constructed at all.**
-
-There is no execution path for an unknown action. Everything goes through a typed IR (`IntentIR`). That IR is only produced by `IRBuilder.build()`, which validates all constraints at construction time. If `build()` returns, the action is valid. If it raises, the action does not exist in this world — not denied, not blocked, impossible.
-
-Execution is separated from policy via a subprocess boundary. The main process does validation. A worker subprocess does execution. The main process holds no callable handlers.
+This is not a product. It is a reusable runtime dependency — an execution
+kernel and taint/provenance evaluation layer consumed by higher-level systems
+such as `agent-world-compiler`. Import it, call `build_runtime()`, use the
+returned `Runtime` object.
 
 ---
 
-## How this differs from guardrails
+## What this kernel does
 
-| Approach | When safety fires | What is prevented |
-|---|---|---|
-| Guardrails / policy engines | After action is formed | Execution of disallowed actions |
-| This runtime | At IR construction | Formation of disallowed actions |
+- **Deterministic policy evaluation**: Given a manifest, a source identity, and
+  a taint context, `IRBuilder.build()` always produces the same decision. No
+  randomness, no side effects, no external calls at decision time.
 
-With guardrails: the action exists as a request, a policy intercepts it, and the system denies execution.
+- **Construction-time enforcement**: All constraint checking happens at IR
+  construction (`IRBuilder.build()`), not at execution time. If `build()`
+  returns an `IntentIR`, every constraint has already been satisfied. If it
+  raises, nothing executes.
 
-With this runtime: an undefined action cannot become a request. There is no object to intercept. The construction fails.
+- **Taint propagation**: `TaintedValue` wraps every executor result. `TaintContext`
+  threads taint across pipeline stages. Taint is monotonic — it cannot decrease.
+  TAINTED + EXTERNAL action = `TaintViolation` at construction time.
 
-Taint works the same way. Tainted data flowing into an external action does not reach a policy check — `IRBuilder.build()` raises before the `ExecutionSpec` is created.
+- **Capability enforcement**: Source identities resolve to trust levels via the
+  compiled policy. Trust levels are checked against a `frozenset` capability
+  matrix — O(1), no string comparison, no YAML re-parsing.
+
+- **Ontological absence**: Actions not in `world_manifest.yaml` are
+  unrepresentable. They cannot be expressed as `IntentIR`. There is no
+  execution-time deny — there is no object to execute.
+
+- **Manifest compilation**: `compile_world(path)` reads the manifest once at
+  startup and returns a frozen `CompiledPolicy`. After that, no file I/O
+  occurs on the decision path.
 
 ---
 
-## LLM-in-the-loop demo
+## What this kernel does NOT do
 
-```bash
-python demo_llm.py
+- No UI, no API server, no HTTP endpoints
+- No LLM routing or prompt handling
+- No workflow orchestration or task scheduling
+- No dynamic action registration (manifest is static at startup)
+- No audit logging (add this in the layer above)
+- No OS-level isolation (no seccomp, containers, or namespaces)
+- No approval token support yet (`ApprovalRequired` is raised; deferred)
+
+---
+
+## Terminology
+
+| Term | Meaning in this kernel |
+|---|---|
+| **Action** | A named operation defined in the manifest |
+| **Ontology** | The set of registered actions in the compiled policy |
+| **Policy** | The compiled capability matrix + taint rules |
+| **Trust level** | `TRUSTED` or `UNTRUSTED`, resolved from source identity |
+| **Capability** | Whether a trust level may perform an action type |
+| **Enforcement** | IR construction — constraints evaluated here, not at execution |
+| **Decision** | The result of `IRBuilder.build()`: success (IntentIR) or typed error |
+| **Taint** | `CLEAN` or `TAINTED`; monotonic, propagated through TaintContext |
+| **Provenance** | Source identity carried in `Source`, derived by `Channel` |
+
+---
+
+## Denial reasons
+
+When `IRBuilder.build()` raises, the exception type identifies the reason.
+Catch the base `ConstructionError` if you don't need to distinguish; use the
+typed subclasses when you do.
+
+| Exception | Meaning |
+|---|---|
+| `NonExistentAction` | Action name not in the compiled policy (ontological absence) |
+| `ConstraintViolation` | Source trust level cannot perform this action type |
+| `TaintViolation` | Tainted context cannot flow into this action (taint rule fired) |
+| `ApprovalRequired` | Action requires an approval token (not yet supported) |
+
+All four are subclasses of `ConstructionError`.
+
+---
+
+## Quick start
+
+```python
+from runtime import build_runtime, TaintContext, TaintedValue
+from runtime import NonExistentAction, TaintViolation, ConstraintViolation
+
+# 1. Compile manifest once at startup
+rt = build_runtime("world_manifest.yaml")
+
+# 2. Resolve source identity to a trust-bearing channel
+channel = rt.channel("user")   # trust level resolved from manifest
+source = channel.source
+
+# 3. Build IR — all constraints checked here
+try:
+    ir = rt.builder.build(
+        action_name="read_data",
+        source=source,
+        params={"query": "hello"},
+        taint_context=TaintContext.clean(),
+    )
+except NonExistentAction:
+    ...  # action not registered
+except ConstraintViolation:
+    ...  # trust level insufficient
+except TaintViolation:
+    ...  # tainted data cannot reach this action
+
+# 4. Execute — only reached if build() succeeded
+result: TaintedValue = rt.sandbox.execute(ir)
+print(result.value, result.taint)
 ```
 
-The LLM only proposes tool calls — it turns natural language into a structured
-`ToolRequest`. The `SafeMCPProxy` and ontology runtime are the enforcement point:
-unsafe proposals are rejected at IR construction time and never reach the worker
-subprocess. A real provider can be swapped in via `OPENAI_API_KEY`, but the
-default path is deterministic and runs offline.
+### Taint propagation
 
-## Safe MCP Proxy demo
-
-```bash
-python demo_proxy.py
+```python
+# Thread taint through a pipeline
+step1 = rt.sandbox.execute(ir_step1)             # TaintedValue
+ctx   = TaintContext.from_outputs(step1)          # carries step1's taint
+ir2   = rt.builder.build("summarize", source, {}, ctx)
+step2 = rt.sandbox.execute(ir2)                  # taint is monotonic: CLEAN v TAINTED = TAINTED
 ```
 
-A thin proxy layer sits between an agent/LLM client and tool execution,
-enforcing the ontology runtime before any tool call reaches execution.
-All three demo scenarios — unknown tool, tainted external call, clean
-internal call — demonstrate that the proxy is not advisory: it is the
-only route. There is no side door to tool execution.
+### Using the proxy
 
-This is not a full MCP implementation. It demonstrates the enforcement shape:
-agent request → proxy validation → runtime construction → worker subprocess.
+`SafeMCPProxy` is an in-path enforcement layer for callers that send tool
+requests as dicts (e.g. MCP clients, LLM tool-call adapters). It maps tool
+names to action names and delegates all constraint checking to `IRBuilder`.
+
+```python
+from runtime.proxy import SafeMCPProxy
+
+proxy = SafeMCPProxy(rt)
+response = proxy.handle({"tool": "read_data", "params": {}, "source": "user", "taint": False})
+print(response.status)       # "ok" | "impossible" | "require_approval"
+print(response.denial_kind)  # "non_existent_action" | "taint_violation" | ...
+```
 
 ---
 
-## 60-second quickstart
+## Manifest format
+
+```yaml
+actions:
+  read_data:       { type: internal }
+  send_email:      { type: external }
+  download_report: { type: internal, approval_required: true }
+  post_webhook:    { type: external }
+
+trust:
+  user:     trusted
+  system:   trusted
+  external: untrusted
+
+capabilities:
+  trusted:   [internal, external]
+  untrusted: [internal]
+
+taint_rules:
+  - taint: tainted
+    action_type: external
+    reason: "Tainted data cannot flow into external actions"
+```
+
+---
+
+## API surface
+
+The stable, importable API surface:
+
+```
+runtime.build_runtime(manifest_path) -> Runtime
+runtime.compile_world(manifest_path) -> CompiledPolicy
+
+Runtime.channel(identity: str) -> Channel
+Runtime.builder -> IRBuilder
+Runtime.sandbox  -> Executor
+Runtime.policy   -> CompiledPolicy
+
+IRBuilder.build(action_name, source, params, taint_context) -> IntentIR
+
+Executor.execute(ir: IntentIR) -> TaintedValue
+
+TaintContext.clean() -> TaintContext
+TaintContext.from_outputs(*tvs: TaintedValue) -> TaintContext
+
+TaintedValue.map(f) -> TaintedValue
+TaintedValue.join(*tvs) -> TaintState
+
+# Enumerations
+TaintState.CLEAN / TAINTED
+TrustLevel.TRUSTED / UNTRUSTED
+ActionType.INTERNAL / EXTERNAL
+
+# Errors
+ConstructionError       (base)
+  NonExistentAction
+  ConstraintViolation
+  TaintViolation
+  ApprovalRequired
+```
+
+Keep the above stable. Higher-level systems (`agent-world-compiler`, etc.)
+import from `runtime` and depend on this surface not changing shape.
+
+---
+
+## Running tests
 
 ```bash
-pip install pyyaml
-python demo.py
-python demo_proxy.py
-python demo_llm.py
+pip install -e ".[dev]"
 pytest
 ```
 
-**What you should see:**
-
-- Demo 1: `ConstructionError` for `delete_repository` — not in the ontology, worker never called
-- Demo 2: `ConstructionError` for tainted data into `post_webhook` (external) — taint rule fires at IR construction
-- Demo 3: `[worker] executed read_data` — execution crossed the subprocess boundary
+Tests cover: construction-time enforcement, process boundary invariants,
+proxy layer, taint propagation, determinism, and typed denial reasons.
 
 ---
 
-## Example output
+## How other repos consume this
 
-```
-============================================================
-DEMO 1 — Unknown action (ontological absence)
-Attempting to construct IR for: delete_repository
-------------------------------------------------------------
-ConstructionError : ConstructionError: Action 'delete_repository' does not exist in the compiled policy — undefined actions are impossible, not denied
-Result            : action does not exist — IR cannot be formed, worker not called
-
-============================================================
-DEMO 2 — Taint containment
-trusted source, tainted data → external action (post_webhook)
-------------------------------------------------------------
-ConstructionError : ConstructionError: Taint rule violation: Tainted data cannot flow into external actions — IR construction blocked — IR cannot be formed
-Result            : taint blocks external boundary — worker not called
-
-============================================================
-DEMO 3 — Allowed internal action (crosses subprocess boundary)
-trusted source, clean context → internal action (read_data)
-→ worker subprocess will announce execution on stderr
-------------------------------------------------------------
-[worker] executed read_data
-IR taint   : clean
-Result     : TaintedValue(taint='clean', value={'data': 'sales Q1', 'source': 'db'})
+```toml
+# In pyproject.toml of the consuming repo:
+[project]
+dependencies = [
+    "safe-agent-runtime-core @ git+https://github.com/your-org/safe-agent-runtime-core",
+]
 ```
 
-`[worker] executed read_data` is printed by `worker.py` to stderr. It proves execution happened in a different process.
+```python
+# In the consuming repo:
+from runtime import build_runtime, TaintContext, ConstructionError
+```
+
+The consuming repo is responsible for: manifest authoring, LLM routing,
+approval tokens, audit logging, orchestration, and UI. None of those belong
+here.
 
 ---
 
-## What this is NOT
+## License
 
-- **Not a full sandbox.** The subprocess is a plain Python process — no OS-level isolation, no seccomp, no namespaces.
-- **Not OS-level isolation.** The worker inherits the parent's filesystem, environment, and network access.
-- **Not production-ready security.** This is a runtime model, not a hardened deployment.
-- **Not a generic policy engine.** There is no rule language, deny list, or middleware stack. The world is defined by the manifest; everything outside it is unconstructible.
-
----
-
-## Architecture
-
-```
-world_manifest.yaml
-      │
-      ▼
-compile_world()  ──────────────────► CompiledPolicy (frozen metadata, no handlers)
-      │                                    │
-      ▼                                    ▼
-   Channel                            IRBuilder
-(trust from compiled map)       (construction-time checks:
-      │                          ontology, capability, taint)
-      ▼                                    │
-    Source  ──────────────────────►  IntentIR
-                                          │
-                                          ▼
-                                    Executor (transport only)
-                                          │
-                                     stdin/stdout
-                                          │
-                                          ▼
-                                    worker.py subprocess
-                                    (handlers live here)
-                                          │
-                                          ▼
-                                    TaintedValue
-```
-
-**Main process:** policy, validation, IR construction. No handlers.
-**Worker process:** execution only. No policy evaluation.
-
-The only thing that crosses the subprocess boundary is an `ExecutionSpec` (action name + params). No handler functions, no policy objects, no taint metadata cross the wire.
-
----
-
-## Key properties
-
-**Ontological absence** — Actions not in `world_manifest.yaml` do not exist in the runtime. Attempting to construct IR raises `ConstructionError` before any execution path is entered — not a runtime denial, a construction failure.
-
-**Deterministic validation** — `CompiledPolicy` is frozen at startup: `MappingProxyType` action registry, `frozenset` capability matrix, `tuple` taint rules. No dynamic rule evaluation at request time.
-
-**Taint containment** — `TAINTED` + `EXTERNAL` → `ConstructionError`. Taint is derived from prior `TaintedValue` outputs via `TaintContext`, a required (non-variadic) argument to `build()`. Dropping taint requires explicitly calling `TaintContext.clean()`.
-
-**Process boundary** — The main process holds no handler functions. `Executor` spawns a subprocess, sends a serialized spec, and reads a JSON response. The worker has its own closed registry; unknown action names fail there too.
-
----
-
-## Repo structure
-
-```
-safe-agent-runtime-core/
-├── world_manifest.yaml          # declares actions, trust, capabilities, taint rules
-├── demo.py                      # three scenarios: unknown action, taint block, subprocess exec
-├── demo_proxy.py                # proxy layer demo: unknown tool, tainted call, allowed call
-├── demo_llm.py                  # LLM-in-the-loop demo: proposer → proxy → runtime → worker
-├── runtime/
-│   ├── models.py                # TaintState, ActionType, TrustLevel, ConstructionError
-│   ├── compile.py               # manifest → frozen CompiledPolicy
-│   ├── channel.py               # Channel + sealed Source (trust from policy, not caller)
-│   ├── taint.py                 # TaintedValue[T], TaintContext
-│   ├── ir.py                    # sealed IntentIR + IRBuilder (all checks at construction)
-│   ├── executor.py              # subprocess transport — no handlers
-│   ├── worker.py                # standalone subprocess; closed handler registry
-│   ├── runtime.py               # build_runtime() — wires everything
-│   ├── protocol.py              # ToolRequest / ProxyResponse (proxy surface types)
-│   ├── proxy.py                 # SafeMCPProxy — in-path enforcement layer
-│   └── llm_demo.py              # MockLLMProposer + optional OpenAIProposer
-└── tests/
-    ├── test_new_runtime.py      # core invariant tests
-    ├── test_process_boundary.py # boundary property tests
-    ├── test_proxy.py            # proxy layer tests
-    └── test_llm_demo.py         # LLM demo invariant tests
-```
-
----
-
-## Limitations
-
-- Worker is a local subprocess — no container, seccomp, or namespace isolation
-- World manifest is static at startup; no dynamic action registration
-- No audit log or provenance tracking
-- `approval_required: true` actions currently fail at construction (honestly documented)
-- Taint is binary (clean/tainted); no labeled taint or flow tracking
-
----
-
-## Requirements
-
-Python 3.10+, PyYAML 6.0+
-
-For more on the design rationale: [docs/why-this-matters.md](docs/why-this-matters.md)
-
----
-
-## Integrations
-
-All integrations route tool execution through SafeMCPProxy, enforcing construction-time constraints before any action reaches execution.
-
-### LangChain
-
-```bash
-python examples/langchain_integration.py
-```
-
-### OpenAI Responses API
-
-```bash
-export OPENAI_API_KEY=...
-python examples/openai_responses_integration.py
-```
-
-### MCP Server
-
-```bash
-python examples/mcp_server_with_proxy.py
-```
+MIT

@@ -32,7 +32,16 @@ from typing import Any, Dict
 
 from .compile import CompiledAction, CompiledPolicy
 from .channel import Source
-from .models import ActionType, ConstructionError, TaintState, TrustLevel
+from .models import (
+    ActionType,
+    ApprovalRequired,
+    ConstraintViolation,
+    ConstructionError,
+    NonExistentAction,
+    TaintState,
+    TaintViolation,
+    TrustLevel,
+)
 from .taint import TaintContext, TaintedValue
 
 
@@ -132,21 +141,21 @@ class IRBuilder:
         # ── 1. Ontological check ───────────────────────────────────────────────
         action = policy.get_action(action_name)
         if action is None:
-            raise ConstructionError(
+            raise NonExistentAction(
                 f"Action {action_name!r} does not exist in the compiled policy — "
                 f"undefined actions are impossible, not denied"
             )
 
         # ── 2. Capability check (O(1) frozenset lookup) ────────────────────────
         if not policy.can_perform(source.trust_level, action.action_type):
-            raise ConstructionError(
+            raise ConstraintViolation(
                 f"Trust level {source.trust_level.value!r} does not have capability "
                 f"for {action.action_type.value!r} actions — IR cannot be formed"
             )
 
         # ── 3. Approval gate (deferred) ────────────────────────────────────────
         if action.approval_required:
-            raise ConstructionError(
+            raise ApprovalRequired(
                 f"Action {action_name!r} requires approval — "
                 f"approval token support is deferred; IR construction blocked"
             )
@@ -157,7 +166,7 @@ class IRBuilder:
         # ── 5. Taint rule check ────────────────────────────────────────────────
         taint_rule = policy.taint_rule_for(computed_taint, action.action_type)
         if taint_rule is not None:
-            raise ConstructionError(
+            raise TaintViolation(
                 f"Taint rule violation: {taint_rule.reason} — IR cannot be formed"
             )
 
