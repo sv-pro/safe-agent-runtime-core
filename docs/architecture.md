@@ -32,6 +32,60 @@ At **World Manifest**, the declared ontology determines what actions exist. At *
 
 ---
 
+## Capability Rendering
+
+**Capability Rendering** is the process by which a world manifest and a source identity are combined to produce the rendered tool surface — the set of actions that are structurally representable for that identity.
+
+### Definitions
+
+- **Raw tools** — ambient capability: every action that the execution environment could expose. The full set of registerable, invocable operations before any identity-based constraint is applied.
+- **Rendered capabilities** — the constrained execution surface produced for a specific source identity: the intersection of declared actions and what that identity's trust level permits.
+
+### The rendering pipeline
+
+```
+Raw tools (environment capability)
+        │
+        ▼
+world_manifest.yaml
+  declares the intended ontology — a subset of raw tools
+        │
+        ▼
+compile_world()  →  CompiledPolicy
+  frozen capability matrix, compiled once at startup
+        │
+        ▼
+channel(identity)  →  TrustLevel
+  source identity resolved to TRUSTED or UNTRUSTED
+        │
+        ▼
+capability matrix[trust_level] → {action_types}
+  determines which action types this identity can reach
+        │
+        ▼
+Rendered Capability Surface
+  actions the agent can represent as IntentIR
+```
+
+### Agent visibility
+
+The agent only sees the rendered surface. An action absent from the manifest is invisible: it cannot be named, constructed, or requested. An action present in the manifest but outside the agent's trust-level capability is equally invisible — it is not in the rendered surface for that identity.
+
+This is not access control in the traditional sense. Access control maintains a list of resources and decides who may use each. Capability rendering constructs the list itself per identity. The agent does not receive a "denied" response for absent actions — there is no response because there is no request representable.
+
+### Construction vs. filtering
+
+| Property | Filtering | Capability Rendering |
+|---|---|---|
+| Decision point | Evaluation of a formed request | Construction of the request itself |
+| Forbidden action | Exists as an object; policy denies it | Does not exist in the rendered surface |
+| Bypass risk | Any gap in the deny logic | None: object cannot be constructed |
+| Attack surface | All actions (filtered at runtime) | Rendered surface only |
+
+Filtering says: "this request is denied." Capability rendering says: "this request cannot be formed."
+
+---
+
 ## Key Distinction
 
 **Guardrail systems** evaluate behavior: a request is formed, a policy examines it, and the system allows or denies.

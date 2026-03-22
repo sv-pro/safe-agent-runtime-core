@@ -94,6 +94,65 @@ returns an `IntentIR` has already passed every constraint. Anything that raises
 
 ---
 
+## Capability Rendering
+
+**Raw tools** are the ambient capability of the environment — every action that could conceivably be registered, invoked, or exposed. They represent the full surface of what the execution environment is capable of doing.
+
+**Rendered capabilities** are what the agent actually sees: a constrained execution surface constructed from the manifest for a specific source identity and trust level. Not a filtered view of raw tools — a freshly constructed surface that never contained the absent ones.
+
+### How rendering works
+
+```
+world_manifest.yaml          →    CompiledPolicy
+  (all declared actions)          (frozen capability matrix)
+         │
+         ▼
+  source identity resolved
+  to trust level (TRUSTED / UNTRUSTED)
+         │
+         ▼
+  capability matrix applied    →   Rendered Tool Surface
+  (trust level × action type)      (actions the agent can reach)
+         │
+         ▼
+  IRBuilder.build()            →   IntentIR  (or ConstructionError)
+```
+
+The manifest declares the world. The compiled policy resolves source identity to trust level. The capability matrix intersects trust level with action type. The result is the rendered tool surface — the only actions representable as `IntentIR` for that source.
+
+An agent operating through this runtime does not see `delete_database` if `delete_database` is absent from the manifest. It does not see `post_webhook` if its trust level lacks `external` capability. Those actions are not hidden — they are absent. There is no object to request, intercept, or deny.
+
+### This is construction, not filtering
+
+A filtering approach works like this:
+1. Agent requests an action
+2. A policy evaluates the request
+3. The system allows or denies
+
+Capability rendering works like this:
+1. Manifest is compiled at startup into a capability matrix
+2. Source identity is resolved to a trust level
+3. The rendered surface is constructed — it contains only what that identity can reach
+4. Agent can only form requests for actions in the rendered surface
+
+The difference is structural. Filtering assumes a request exists and decides what to do with it. Rendering determines what requests can exist. A denied action in a filter system still exists as an object — it was formed, evaluated, and rejected. An absent action in a rendered surface was never formable. `IRBuilder.build()` raises `NonExistentAction` not because a rule fired, but because the action has no representation in the compiled policy.
+
+### Attack surface reduction
+
+Because forbidden actions are absent rather than denied, they cannot be:
+
+- Expressed as `IntentIR` (no object, no construction path)
+- Reached via edge cases in policy evaluation logic
+- Exposed by misconfigurations in the deny layer
+
+The attack surface is the rendered surface. Reduce what the manifest declares, and you reduce what the runtime can do — not just what it will allow.
+
+### What capability rendering does not mean
+
+Rendered capabilities are still subject to policy constraints. An action present in the rendered surface may still raise `ConstraintViolation` (trust level insufficient for a specific call) or `TaintViolation` (tainted data flowing into an external action). Rendering establishes structural absence; policy enforces the constraints on what is present.
+
+---
+
 ## Terminology
 
 | Term | Meaning in this kernel |
