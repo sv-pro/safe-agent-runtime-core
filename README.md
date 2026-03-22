@@ -9,6 +9,50 @@ returned `Runtime` object.
 
 ---
 
+## What this system is
+
+`safe-agent-runtime-core` is a **Safe MCP Proxy** — an **Agent Runtime Firewall**
+that sits between an agent and its tools. It is not a guardrail. It is not a
+filter. It is an execution environment: the only actions that can run are the
+ones that can be constructed.
+
+```
+  Agent / LLM
+      │
+      ▼
+┌─────────────────────────┐
+│   Safe MCP Proxy        │  ← you are here
+│   (IRBuilder + Sandbox) │
+│   compiled policy       │
+└─────────────────────────┘
+      │
+      ▼
+  Tools / Executors
+```
+
+**Enforcement is by construction, not by interception:**
+
+| Scenario | What happens |
+|---|---|
+| Agent requests an unsafe tool (e.g. `delete_database`) | `NonExistentAction` — the object does not exist; there is nothing to intercept |
+| Agent requests a constrained tool (e.g. `send_email`) with tainted data | `TaintViolation` raised at `IRBuilder.build()` — execution never begins |
+| Agent requests an allowed tool with clean data and sufficient trust | `IntentIR` produced; `Executor.execute()` called |
+
+This means:
+
+- **Unsafe tool → does not exist.** Actions absent from `world_manifest.yaml`
+  are unrepresentable as `IntentIR`. The proxy has no deny rule for them — they
+  simply have no corresponding object.
+- **Constrained tool → enforced.** Actions present in the manifest are checked
+  at construction time against trust level, taint state, and approval
+  requirements. A constraint failure raises before any side effect occurs.
+
+The runtime firewall boundary is the `IRBuilder.build()` call. Anything that
+returns an `IntentIR` has already passed every constraint. Anything that raises
+`ConstructionError` never touches an executor.
+
+---
+
 ## What this kernel does
 
 - **Deterministic policy evaluation**: Given a manifest, a source identity, and
