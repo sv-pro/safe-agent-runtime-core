@@ -1,4 +1,4 @@
-> **⚠️ Archived — reference only.** Part of the *Agentic Execution Governance* research cluster, preserved read-only for its lineage. **Active development lives in [ai2rules](https://github.com/sv-pro/ai2rules).** See that repo's `DECISIONS.md` (D38, D40) for how this work was superseded and where each idea now lives.
+> **⚠️ Archived — reference only.** Part of the *Agentic Execution Governance* research cluster, preserved read-only for its lineage. **Active development lives in [ai2rules](https://ai2rules.dev/kernel/).** Its decisions [D38](https://ai2rules.dev/kernel/decisions/#d38--the-march-2026-runtime-cluster-is-superseded-record-the-lineage) and [D40](https://ai2rules.dev/kernel/decisions/#d40--repository-topology-one-live-implementation-the-rest-archived-reference-completes-73--d39) record how this work was superseded and where each idea now lives.
 >
 > **This repo:** Deterministic policy kernel + IRBuilder + taint/provenance (Mar 2026). Its "Agent Runtime Firewall" framing carried into `safe-mcp-proxy`; its kernel became `ai2rules/crates/world-kernel`.
 
